@@ -114,7 +114,7 @@ async def chat_message(
         asyncio.to_thread(
             fetchone,
             "SELECT id, expires_at FROM user_subscriptions "
-            "WHERE user_id = %s AND exam_slug = %s AND status = 'active' LIMIT 1",
+            "WHERE user_id = %s AND exam_slug = %s AND status IN ('active', 'trial') LIMIT 1",
             (user_id, body.exam_slug),
         ),
         asyncio.to_thread(
@@ -125,7 +125,7 @@ async def chat_message(
     )
 
     if not sub and not settings.bypass_subscription:
-        raise HTTPException(status_code=403, detail="No active subscription for this exam")
+        raise HTTPException(status_code=403, detail="No active subscription for this exam. Start a free trial from the Practice page.")
 
     if sub and not settings.bypass_subscription:
         expires_at = sub["expires_at"]
