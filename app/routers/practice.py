@@ -100,17 +100,17 @@ def _select_domain(exam_slug: str, domain_scores: dict) -> str:
     return random.choices([d["name"] for d in domains], weights=weights, k=1)[0]
 
 
-# ── Question set selection ────────────────────────────────────────────────────
+# ── Practice session management ───────────────────────────────────────────────
 
-def _determine_current_set(exam_slug: str, questions_seen: list) -> int:
+def _find_set_for_new_session(exam_slug: str, questions_seen: list) -> int:
     """
-    Return the set_number to draw from.
+    Determine which set_number a new practice session should be assigned to.
 
-    Rules:
-    - Find all distinct set numbers that exist for this exam
-    - Prefer the lowest-numbered set that still has unseen questions for this user
-    - If a set has < SET_SIZE questions it is still being built → include it
-    - If all questions in all sets are seen, return max_set + 1 (new set)
+    Priority:
+    1. The lowest set that is still being built (< SET_SIZE questions) — user
+       draws existing questions and their answers generate new ones into this set.
+    2. The lowest full set where the user still has unseen questions.
+    3. A brand-new set (max + 1) if the user has exhausted everything.
     """
     rows = fetchall(
         "SELECT set_number, COUNT(*) AS cnt FROM questions "
@@ -119,26 +119,65 @@ def _determine_current_set(exam_slug: str, questions_seen: list) -> int:
         (exam_slug,),
     )
     if not rows:
-        return 1  # no questions yet, AI will generate into set 1
+        return 1  # first ever question will be generated into set 1
 
     seen_set = set(questions_seen)
     for row in rows:
-        sn = row["set_number"]
-        cnt = row["cnt"]
-        # If set is still being built (<SET_SIZE), always draw from it
+        sn, cnt = row["set_number"], row["cnt"]
         if cnt < SET_SIZE:
-            return sn
-        # Check if user has any unseen questions in this set
-        set_ids = fetchall(
+            return sn  # still building — join this set
+        # Full set: check if user has unseen questions here
+        ids = fetchall(
             "SELECT id FROM questions WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE",
             (exam_slug, sn),
         )
-        unseen = [r["id"] for r in set_ids if r["id"] not in seen_set]
-        if unseen:
+        if any(r["id"] not in seen_set for r in ids):
             return sn
 
-    # All sets exhausted — start a new one
-    return rows[-1]["set_number"] + 1
+    return rows[-1]["set_number"] + 1  # start a new set
+
+
+def _get_or_create_practice_session(user_id: str, exam_slug: str, questions_seen: list) -> dict:
+    """
+    Return the user's current incomplete practice session, creating one if needed.
+    One session = one set of up to SET_SIZE questions.
+    """
+    session = fetchone(
+        "SELECT id, set_number, questions_answered, is_complete FROM practice_sessions "
+        "WHERE user_id = %s AND exam_slug = %s AND is_complete = FALSE "
+        "ORDER BY created_at DESC LIMIT 1",
+        (user_id, exam_slug),
+    )
+    if session:
+        return dict(session)
+
+    set_number = _find_set_for_new_session(exam_slug, questions_seen)
+    session_id = str(uuid.uuid4())
+    execute(
+        "INSERT INTO practice_sessions (id, user_id, exam_slug, set_number) "
+        "VALUES (%s, %s, %s, %s)",
+        (session_id, user_id, exam_slug, set_number),
+    )
+    return {"id": session_id, "set_number": set_number, "questions_answered": 0, "is_complete": False}
+
+
+def _mark_session_complete(session_id: str) -> None:
+    execute(
+        "UPDATE practice_sessions SET is_complete = TRUE, last_active_at = NOW() WHERE id = %s",
+        (session_id,),
+    )
+
+
+def _increment_session(session_id: str) -> int:
+    """Increment questions_answered; return new count."""
+    row = execute(
+        "UPDATE practice_sessions "
+        "SET questions_answered = questions_answered + 1, last_active_at = NOW() "
+        "WHERE id = %s "
+        "RETURNING questions_answered",
+        (session_id,),
+    )
+    return row["questions_answered"] if row else 0
 
 
 # ── Question pool fetch (DB + Redis) ──────────────────────────────────────────
@@ -196,7 +235,7 @@ def _prefetch_question_for_user(user_id: str, exam_slug: str) -> None:
         questions_seen = progress["questions_seen"] if progress else []
 
         domain = _select_domain(exam_slug, domain_scores)
-        set_number = _determine_current_set(exam_slug, questions_seen)
+        set_number = _find_set_for_new_session(exam_slug, questions_seen)
         pool = _fetch_question_pool(exam_slug, domain, questions_seen, set_number)
 
         if pool:
@@ -232,7 +271,7 @@ async def get_question(
     questions_seen = progress["questions_seen"] if progress else []
 
     domain = _select_domain(body.exam_slug, domain_scores)
-    set_number = _determine_current_set(body.exam_slug, questions_seen)
+    set_number = _find_set_for_new_session(body.exam_slug, questions_seen)
     pool = _fetch_question_pool(body.exam_slug, domain, questions_seen, set_number)
 
     if pool:
