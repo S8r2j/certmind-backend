@@ -350,17 +350,16 @@ async def submit_answer(
     correct = body.answer == q["correct_answer"]
     domain = q["domain"]
 
+    # Update user progress
     progress = fetchone(
         "SELECT id, domain_scores, questions_seen, total_answered, total_correct "
         "FROM user_progress WHERE user_id = %s AND exam_slug = %s",
         (user_id, body.exam_slug),
     )
-
     if progress:
         domain_scores = progress["domain_scores"] or {}
         questions_seen = progress["questions_seen"] or []
-        if domain not in domain_scores:
-            domain_scores[domain] = {"correct": 0, "total": 0}
+        domain_scores.setdefault(domain, {"correct": 0, "total": 0})
         domain_scores[domain]["total"] += 1
         if correct:
             domain_scores[domain]["correct"] += 1
@@ -375,7 +374,8 @@ async def submit_answer(
     else:
         domain_scores = {domain: {"correct": 1 if correct else 0, "total": 1}}
         execute(
-            "INSERT INTO user_progress (id, user_id, exam_slug, domain_scores, questions_seen, total_answered, total_correct) "
+            "INSERT INTO user_progress "
+            "(id, user_id, exam_slug, domain_scores, questions_seen, total_answered, total_correct) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
                 str(uuid.uuid4()), user_id, body.exam_slug,
@@ -384,12 +384,28 @@ async def submit_answer(
             ),
         )
 
-    # Fire prefetch in background so the next question is ready before user clicks Next
-    background_tasks.add_task(_prefetch_question_for_user, user_id, body.exam_slug)
+    # Advance practice session counter; mark complete if we just hit SET_SIZE
+    session = fetchone(
+        "SELECT id, questions_answered FROM practice_sessions "
+        "WHERE user_id = %s AND exam_slug = %s AND is_complete = FALSE "
+        "ORDER BY created_at DESC LIMIT 1",
+        (user_id, body.exam_slug),
+    )
+    session_complete = False
+    if session:
+        new_count = _increment_session(session["id"])
+        if new_count >= SET_SIZE:
+            _mark_session_complete(session["id"])
+            session_complete = True
+
+    # Prefetch next question in background (only if session not done)
+    if not session_complete:
+        background_tasks.add_task(_prefetch_question_for_user, user_id, body.exam_slug)
 
     return {
         "correct": correct,
         "correct_answer": q["correct_answer"],
         "explanation": q["explanation"],
         "domain_scores": domain_scores,
+        "session_complete": session_complete,
     }
