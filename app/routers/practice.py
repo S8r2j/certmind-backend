@@ -184,36 +184,21 @@ def _increment_session(session_id: str) -> int:
 
 def _fetch_question_pool(exam_slug: str, domain: str, questions_seen: list, set_number: int) -> list[dict]:
     """
-    Return up to 20 candidate questions.
-    Tries Redis pool cache first; falls back to DB and populates cache.
-    The cache is shared across users for the same exam+domain, so filtering
-    for `questions_seen` (per-user) is done after retrieval.
+    Return unseen candidate questions for the given domain + set.
+    Shared Redis cache per exam+domain+set; per-user filtering applied after retrieval.
     """
-    pool = get_cached_pool(exam_slug, domain)
+    pool = get_cached_pool(exam_slug, f"{domain}:set{set_number}")
     if pool is None:
-        # DB query — fetches up to 20 active questions for this domain+set
-        if questions_seen:
-            pool = fetchall(
-                "SELECT id, exam_slug, domain, topic, stem, options, difficulty FROM questions "
-                "WHERE exam_slug = %s AND domain = %s AND set_number = %s "
-                "AND is_active = TRUE AND id != ALL(%s) LIMIT 20",
-                (exam_slug, domain, set_number, questions_seen),
-            )
-        else:
-            pool = fetchall(
-                "SELECT id, exam_slug, domain, topic, stem, options, difficulty FROM questions "
-                "WHERE exam_slug = %s AND domain = %s AND set_number = %s "
-                "AND is_active = TRUE LIMIT 20",
-                (exam_slug, domain, set_number),
-            )
+        pool = fetchall(
+            "SELECT id, exam_slug, domain, topic, stem, options, difficulty FROM questions "
+            "WHERE exam_slug = %s AND domain = %s AND set_number = %s AND is_active = TRUE LIMIT 20",
+            (exam_slug, domain, set_number),
+        )
         if pool:
-            cache_question_pool(exam_slug, domain, pool)
-    else:
-        # Filter out already-seen questions from the cached pool
-        seen_set = set(questions_seen)
-        pool = [q for q in pool if q["id"] not in seen_set]
+            cache_question_pool(exam_slug, f"{domain}:set{set_number}", pool)
 
-    return pool or []
+    seen_set = set(questions_seen)
+    return [q for q in (pool or []) if q["id"] not in seen_set]
 
 
 # ── Background prefetch ───────────────────────────────────────────────────────
