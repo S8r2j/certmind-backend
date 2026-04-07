@@ -205,10 +205,8 @@ def _fetch_question_pool(exam_slug: str, domain: str, questions_seen: list, set_
 
 def _prefetch_question_for_user(user_id: str, exam_slug: str) -> None:
     """
-    Called as a background task after submit_answer.
-    Picks the likely-next question and stores it in Redis so get_question
-    can serve it instantly without hitting the DB.
-    Does NOT fall back to AI generation — prefetch is best-effort.
+    Best-effort: pick the likely-next question and cache it in Redis.
+    Uses the user's current practice session to respect set boundaries.
     """
     try:
         progress = fetchone(
@@ -219,8 +217,17 @@ def _prefetch_question_for_user(user_id: str, exam_slug: str) -> None:
         domain_scores = progress["domain_scores"] if progress else {}
         questions_seen = progress["questions_seen"] if progress else []
 
+        session = fetchone(
+            "SELECT set_number FROM practice_sessions "
+            "WHERE user_id = %s AND exam_slug = %s AND is_complete = FALSE "
+            "ORDER BY created_at DESC LIMIT 1",
+            (user_id, exam_slug),
+        )
+        if not session:
+            return
+
+        set_number = session["set_number"]
         domain = _select_domain(exam_slug, domain_scores)
-        set_number = _find_set_for_new_session(exam_slug, questions_seen)
         pool = _fetch_question_pool(exam_slug, domain, questions_seen, set_number)
 
         if pool:
@@ -228,7 +235,7 @@ def _prefetch_question_for_user(user_id: str, exam_slug: str) -> None:
             q["options"] = _normalize_options(q.get("options") or [])
             set_prefetch(user_id, exam_slug, q)
     except Exception:
-        pass  # prefetch failure is silent — get_question will handle it normally
+        pass
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
