@@ -5,7 +5,8 @@ class Settings(BaseSettings):
     database_url: str
     jwt_secret: str
     jwt_algorithm: str = "HS256"
-    jwt_expire_days: int = 30
+    jwt_access_expire_minutes: int = 2
+    jwt_refresh_expire_days: int = 7
     # AI provider — prefix determines provider:
     #   claude-*  → Anthropic   (needs anthropic_api_key)
     #   gemini-*  → Google      (needs google_api_key, free tier available)
