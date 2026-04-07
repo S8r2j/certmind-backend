@@ -249,34 +249,78 @@ async def get_question(
     await validate_session(request, user_id)
     _check_subscription(user_id, body.exam_slug)
 
-    # 1. Check Redis prefetch first (zero DB queries on cache hit)
-    prefetched = pop_prefetch(user_id, body.exam_slug)
-    if prefetched:
-        return prefetched
-
-    # 2. Cache miss — load progress and select from DB (with Redis pool caching)
+    # Load user progress
     progress = fetchone(
-        "SELECT domain_scores, questions_seen FROM user_progress WHERE user_id = %s AND exam_slug = %s",
+        "SELECT domain_scores, questions_seen FROM user_progress "
+        "WHERE user_id = %s AND exam_slug = %s",
         (user_id, body.exam_slug),
     )
     domain_scores = progress["domain_scores"] if progress else {}
     questions_seen = progress["questions_seen"] if progress else []
 
+    # Get or create practice session (determines which set we're in)
+    session = _get_or_create_practice_session(user_id, body.exam_slug, questions_seen)
+    set_number = session["set_number"]
+    questions_answered = session["questions_answered"]
+
+    # Session already hit SET_SIZE — tell the frontend
+    if questions_answered >= SET_SIZE:
+        _mark_session_complete(session["id"])
+        raise HTTPException(status_code=200, detail="SESSION_COMPLETE")
+
+    def _with_meta(q: dict) -> dict:
+        q["options"] = _normalize_options(q.get("options") or [])
+        q["session_progress"] = {
+            "answered": questions_answered,
+            "total": SET_SIZE,
+            "set_number": set_number,
+        }
+        return q
+
+    # 1. Redis prefetch — only valid if it belongs to the current set
+    prefetched = pop_prefetch(user_id, body.exam_slug)
+    if prefetched and prefetched.get("set_number") == set_number:
+        return _with_meta(prefetched)
+    elif prefetched:
+        # Stale prefetch from a different set — discard silently
+        pass
+
+    # 2. Pool cache → DB
     domain = _select_domain(body.exam_slug, domain_scores)
-    set_number = _find_set_for_new_session(body.exam_slug, questions_seen)
     pool = _fetch_question_pool(body.exam_slug, domain, questions_seen, set_number)
+
+    # If no unseen questions in chosen domain, try any domain in this set
+    if not pool:
+        all_unseen = fetchall(
+            "SELECT id, exam_slug, domain, topic, stem, options, difficulty FROM questions "
+            "WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE "
+            "AND id != ALL(%s) LIMIT 20" if questions_seen else
+            "SELECT id, exam_slug, domain, topic, stem, options, difficulty FROM questions "
+            "WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE LIMIT 20",
+            (body.exam_slug, set_number, questions_seen) if questions_seen else (body.exam_slug, set_number),
+        )
+        pool = all_unseen or []
 
     if pool:
         q = random.choice(pool)
-        q["options"] = _normalize_options(q.get("options") or [])
-        return q
+        return _with_meta(dict(q))
 
-    # 3. Fallback: generate via configured AI provider, insert into current set
+    # 3. Set not full yet → generate from AI and add to current set
+    set_count = fetchone(
+        "SELECT COUNT(*) AS cnt FROM questions WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE",
+        (body.exam_slug, set_number),
+    )
+    if set_count and set_count["cnt"] >= SET_SIZE:
+        # Set is full and user has seen everything — session should be done
+        _mark_session_complete(session["id"])
+        raise HTTPException(status_code=200, detail="SESSION_COMPLETE")
+
     generated = ai_generate_question(body.exam_slug, domain)
     q = execute(
-        "INSERT INTO questions (id, exam_slug, domain, stem, options, correct_answer, explanation, difficulty, set_number) "
+        "INSERT INTO questions "
+        "(id, exam_slug, domain, stem, options, correct_answer, explanation, difficulty, set_number) "
         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-        "RETURNING id, exam_slug, domain, stem, options, difficulty",
+        "RETURNING id, exam_slug, domain, stem, options, difficulty, set_number",
         (
             str(uuid.uuid4()), body.exam_slug, domain,
             generated["stem"], json.dumps(generated["options"]),
@@ -284,9 +328,7 @@ async def get_question(
             set_number,
         ),
     )
-    if q:
-        q["options"] = _normalize_options(q.get("options") or [])
-    return q
+    return _with_meta(dict(q))
 
 
 @router.post("/answer")
