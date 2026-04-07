@@ -23,14 +23,14 @@ async def get_subscription_status(
     if exam_slug:
         row = fetchone(
             "SELECT exam_slug, expires_at, status FROM user_subscriptions "
-            "WHERE user_id = %s AND exam_slug = %s AND status = 'active' "
+            "WHERE user_id = %s AND exam_slug = %s AND status IN ('active', 'trial') "
             "ORDER BY expires_at DESC LIMIT 1",
             (user_id, exam_slug),
         )
     else:
         row = fetchone(
             "SELECT exam_slug, expires_at, status FROM user_subscriptions "
-            "WHERE user_id = %s AND status = 'active' ORDER BY expires_at DESC LIMIT 1",
+            "WHERE user_id = %s AND status IN ('active', 'trial') ORDER BY expires_at DESC LIMIT 1",
             (user_id,),
         )
 
@@ -46,15 +46,18 @@ async def get_subscription_status(
     now = datetime.now(timezone.utc)
     if expires_at <= now:
         execute(
-            "UPDATE user_subscriptions SET status = 'expired' WHERE user_id = %s AND exam_slug = %s",
+            "UPDATE user_subscriptions SET status = 'expired' WHERE user_id = %s AND exam_slug = %s "
+            "AND status IN ('active', 'trial')",
             (user_id, row["exam_slug"]),
         )
         return SubscriptionResponse(active=False)
 
     days_remaining = max(0, (expires_at - now).days)
+    is_trial = row["status"] == "trial"
     return SubscriptionResponse(
         active=True,
         exam_slug=row["exam_slug"],
         expires_at=expires_at.isoformat(),
         days_remaining=days_remaining,
+        is_trial=is_trial,
     )
