@@ -1,6 +1,7 @@
 import json
 import random
 import uuid
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from app.middleware.auth import get_current_user
 from app.middleware.session import validate_session
@@ -11,6 +12,7 @@ from app.services.redis_client import (
     set_prefetch, pop_prefetch,
 )
 from app.schemas.models import QuestionRequest, AnswerRequest
+from app.core.config import settings
 
 router = APIRouter(prefix="/practice", tags=["practice"])
 
@@ -145,6 +147,28 @@ def _prefetch_question_for_user(user_id: str, exam_slug: str) -> None:
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+def _ensure_trial_or_raise(user_id: str, exam_slug: str) -> None:
+    """
+    Auto-create a 7-day trial subscription for the user's first exam.
+    Raises 403 if the trial has already been used for a different exam
+    and no paid subscription exists.
+    """
+    user = fetchone("SELECT trial_used FROM users WHERE id = %s", (user_id,))
+    if user and not user["trial_used"]:
+        trial_expires = datetime.now(timezone.utc) + timedelta(days=7)
+        execute(
+            "INSERT INTO user_subscriptions (id, user_id, exam_slug, status, expires_at) "
+            "VALUES (%s, %s, %s, 'trial', %s)",
+            (str(uuid.uuid4()), user_id, exam_slug, trial_expires),
+        )
+        execute("UPDATE users SET trial_used = TRUE WHERE id = %s", (user_id,))
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="No active subscription for this exam. Your free trial has been used.",
+        )
+
+
 @router.post("/question")
 async def get_question(
     body: QuestionRequest,
@@ -152,6 +176,31 @@ async def get_question(
     user_id: str = Depends(get_current_user),
 ):
     await validate_session(request, user_id)
+
+    # Gate: require active paid or trial subscription (unless bypass is on)
+    if not settings.bypass_subscription:
+        sub = fetchone(
+            "SELECT id, expires_at FROM user_subscriptions "
+            "WHERE user_id = %s AND exam_slug = %s AND status IN ('active', 'trial') "
+            "ORDER BY expires_at DESC LIMIT 1",
+            (user_id, body.exam_slug),
+        )
+        if sub:
+            expires_at = sub["expires_at"]
+            if isinstance(expires_at, str):
+                expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at < datetime.now(timezone.utc):
+                # Expired — mark and fall through to trial check
+                execute(
+                    "UPDATE user_subscriptions SET status = 'expired' "
+                    "WHERE user_id = %s AND exam_slug = %s AND status IN ('active', 'trial')",
+                    (user_id, body.exam_slug),
+                )
+                _ensure_trial_or_raise(user_id, body.exam_slug)
+        else:
+            _ensure_trial_or_raise(user_id, body.exam_slug)
 
     # 1. Check Redis prefetch first (zero DB queries on cache hit)
     prefetched = pop_prefetch(user_id, body.exam_slug)
