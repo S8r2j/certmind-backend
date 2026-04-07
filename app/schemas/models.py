@@ -14,8 +14,13 @@ class LoginRequest(BaseModel):
 
 class AuthResponse(BaseModel):
     access_token: str
+    refresh_token: str
     session_token: str
     email: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
 
 
 class QuestionRequest(BaseModel):
@@ -50,3 +55,4 @@ class SubscriptionResponse(BaseModel):
     exam_slug: Optional[str] = None
     expires_at: Optional[str] = None
     days_remaining: Optional[int] = None
+    is_trial: Optional[bool] = False
