@@ -1,6 +1,5 @@
 import asyncio
 import json
-import re
 import uuid
 from fastapi import APIRouter, Request, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -15,26 +14,6 @@ from app.core.config import settings
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 MAX_TOKENS_PER_DAY = 50000
-
-# Words that strongly suggest the message is about cloud/AI/certification topics
-_EXAM_KEYWORDS = re.compile(
-    r"\b(aws|cloud|exam|certif|domain|s3|ec2|iam|vpc|lambda|sagemaker|bedrock|"
-    r"ai|ml|model|generat|llm|neural|transform|training|inference|"
-    r"security|compliance|governance|architect|resilient|cost|billing|pricing|"
-    r"question|quiz|ask me|explain|what is|how does|define|difference|compare|"
-    r"study|practice|score|domain|weak|strong|gap|prepare|concept|topic)\b",
-    re.IGNORECASE,
-)
-
-def _is_off_topic(text: str, has_history: bool) -> bool:
-    """
-    Return True only if the message is clearly off-topic.
-    Short messages (≤10 chars) and replies within an existing conversation
-    are always allowed through — they're almost certainly contextual.
-    """
-    if has_history or len(text.strip()) <= 10:
-        return False
-    return not _EXAM_KEYWORDS.search(text)
 
 
 def _check_token_budget(user_id: str, subscription_id: str) -> None:
@@ -160,16 +139,6 @@ async def chat_message(
     subscription_id = str(sub["id"]) if sub else "bypass"
     _check_token_budget(user_id, subscription_id)
 
-    # Off-topic check — allow through if continuing an existing session (has context)
-    if _is_off_topic(sanitized, has_history=bool(body.session_id)):
-        refusal = f"I'm here to help you prepare for {exam_title}. Please ask me an exam-related question."
-
-        async def _refusal_stream():
-            yield f"data: {json.dumps({'text': refusal})}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(_refusal_stream(), media_type="text/event-stream")
-
     exam_code = meta.get("code", "")
     domain_list = ", ".join(d["name"] for d in meta.get("domains", []))
 
@@ -185,14 +154,19 @@ async def chat_message(
         weak_context = f" Student's weakest domain: {weakest[0]} ({pct}%)."
 
     system_prompt = (
-        f"You are CertMind AI, an exam tutor for {exam_title} ({exam_code}). "
-        f"Domains: {domain_list}.{weak_context} "
-        "Only answer exam-related questions. "
-        "NEVER generate practice questions, MCQs, or quizzes — if the user asks for a question or quiz, "
-        "respond only with: \"Head to Practice Mode to get adaptive exam questions with answer tracking. "
-        "I'm here to explain concepts and analyze your gaps.\" "
-        "Use Markdown: **bold** key terms, ### section headers, - bullet lists. "
-        "For gap analysis: ### Strengths, ### Focus Areas, ### Action Plan, then a > blockquote with the #1 priority. "
+        f"You are CertMind AI, a focused exam tutor for {exam_title} ({exam_code}). "
+        f"Domains covered: {domain_list}.{weak_context}\n\n"
+        "SCOPE RULES — you decide relevance, not a filter:\n"
+        "1. Answer anything that is directly about this exam, its domains, concepts, the student's progress, "
+        "study tips, or is a natural continuation of the current conversation.\n"
+        "2. If a message is clearly unrelated to the exam AND has no conversational context "
+        "(e.g. 'I love you', 'what is the weather'), reply only with: "
+        f"\"I'm here to help you prepare for {exam_title}. Ask me anything about the exam.\"\n"
+        "3. NEVER generate MCQ practice questions — if asked, say: "
+        "\"Head to Practice Mode for adaptive questions with answer tracking.\"\n\n"
+        "FORMAT: Use Markdown — **bold** key terms, ### headers, - bullet lists. "
+        "For gap/weakness analysis: ### Strengths, ### Focus Areas, ### Action Plan, "
+        "then a > blockquote with the single most critical thing to study. "
         "Be concise. No filler."
     )
 
