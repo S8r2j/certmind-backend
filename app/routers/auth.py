@@ -2,22 +2,32 @@ import secrets
 import uuid
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException, Request, Depends
-from jose import jwt
+from jose import jwt, JWTError
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from app.core.config import settings
 from app.middleware.auth import get_current_user
+from app.middleware.session import validate_session
 from app.services.database import fetchone, execute
-from app.schemas.models import RegisterRequest, LoginRequest, AuthResponse
+from app.schemas.models import RegisterRequest, LoginRequest, AuthResponse, RefreshRequest
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 ph = PasswordHasher()
 
 
-def _make_jwt(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=settings.jwt_expire_days)
+def _make_access_token(user_id: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_access_expire_minutes)
     return jwt.encode(
-        {"sub": user_id, "exp": expire},
+        {"sub": user_id, "type": "access", "exp": expire},
+        settings.jwt_secret,
+        algorithm=settings.jwt_algorithm,
+    )
+
+
+def _make_refresh_token(user_id: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(days=settings.jwt_refresh_expire_days)
+    return jwt.encode(
+        {"sub": user_id, "type": "refresh", "exp": expire},
         settings.jwt_secret,
         algorithm=settings.jwt_algorithm,
     )
@@ -46,9 +56,15 @@ async def register(body: RegisterRequest):
         "INSERT INTO users (id, email, password_hash) VALUES (%s, %s, %s)",
         (user_id, body.email, hashed),
     )
-    access_token = _make_jwt(user_id)
+    access_token = _make_access_token(user_id)
+    refresh_token = _make_refresh_token(user_id)
     session_token = _make_session(user_id)
-    return AuthResponse(access_token=access_token, session_token=session_token, email=body.email)
+    return AuthResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        session_token=session_token,
+        email=body.email,
+    )
 
 
 @router.post("/login", response_model=AuthResponse)
@@ -61,13 +77,34 @@ async def login(body: LoginRequest):
     except VerifyMismatchError:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    access_token = _make_jwt(user["id"])
+    access_token = _make_access_token(user["id"])
+    refresh_token = _make_refresh_token(user["id"])
     session_token = _make_session(user["id"])
-    return AuthResponse(access_token=access_token, session_token=session_token, email=user["email"])
+    return AuthResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        session_token=session_token,
+        email=user["email"],
+    )
 
 
-@router.post("/refresh")
-async def refresh_token(user_id: str = Depends(get_current_user)):
-    """Issue a fresh JWT without re-authenticating (called on app load if token near expiry)."""
-    access_token = _make_jwt(user_id)
-    return {"access_token": access_token}
+@router.post("/token/refresh")
+async def refresh_token(body: RefreshRequest, request: Request):
+    """
+    Exchange a valid refresh token for a new access token.
+    Also validates the session is still active so forced logouts propagate here too.
+    """
+    try:
+        payload = jwt.decode(body.refresh_token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Refresh token expired or invalid")
+
+    # Validate session is still active (catches forced logouts from new device)
+    await validate_session(request, user_id)
+
+    return {"access_token": _make_access_token(user_id)}
