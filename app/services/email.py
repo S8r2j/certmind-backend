@@ -1,0 +1,95 @@
+"""
+Email service — verification and password reset emails.
+
+Uses SMTP with STARTTLS (works with Gmail, Brevo, Mailgun, etc.).
+If SMTP_HOST is not configured, the email link is logged to console
+so development works without an SMTP server.
+"""
+import logging
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+from app.core.config import settings
+
+log = logging.getLogger(__name__)
+
+
+def _send(to: str, subject: str, html: str) -> None:
+    if not settings.smtp_host:
+        log.warning("SMTP not configured — printing email to console instead")
+        log.info("TO: %s | SUBJECT: %s\n%s", to, subject, html)
+        return
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = f"{settings.smtp_from_name} <{settings.smtp_from_email}>"
+    msg["To"] = to
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            if settings.smtp_user and settings.smtp_password:
+                s.login(settings.smtp_user, settings.smtp_password)
+            s.sendmail(settings.smtp_from_email, to, msg.as_string())
+    except Exception as exc:
+        log.error("Failed to send email to %s: %s", to, exc)
+        raise
+
+
+def send_verification_email(to: str, token: str) -> None:
+    link = f"{settings.frontend_url}/verify-email?token={token}"
+    html = f"""
+<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif;background:#f8f9fa;padding:40px 0">
+  <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;border:1px solid #e5e7eb;padding:40px">
+    <h1 style="margin:0 0 4px;font-size:22px;color:#111">Welcome to CertMind</h1>
+    <p style="color:#6b7280;margin:0 0 28px;font-size:14px">Verify your email to get started</p>
+    <p style="color:#374151;font-size:14px;margin:0 0 24px">
+      Click the button below to verify your email address. This link expires in <strong>24 hours</strong>.
+    </p>
+    <a href="{link}"
+       style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;
+              font-weight:600;font-size:14px;padding:12px 28px;border-radius:8px">
+      Verify Email →
+    </a>
+    <p style="color:#9ca3af;font-size:12px;margin:28px 0 0">
+      If you didn't create a CertMind account, you can safely ignore this email.
+    </p>
+  </div>
+</body>
+</html>
+"""
+    _send(to, "Verify your CertMind email", html)
+
+
+def send_password_reset_email(to: str, token: str) -> None:
+    link = f"{settings.frontend_url}/reset-password?token={token}"
+    html = f"""
+<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif;background:#f8f9fa;padding:40px 0">
+  <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;border:1px solid #e5e7eb;padding:40px">
+    <h1 style="margin:0 0 4px;font-size:22px;color:#111">Reset your password</h1>
+    <p style="color:#6b7280;margin:0 0 28px;font-size:14px">CertMind account recovery</p>
+    <p style="color:#374151;font-size:14px;margin:0 0 24px">
+      Click the button below to set a new password. This link expires in <strong>1 hour</strong>.
+    </p>
+    <a href="{link}"
+       style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;
+              font-weight:600;font-size:14px;padding:12px 28px;border-radius:8px">
+      Reset Password →
+    </a>
+    <p style="color:#9ca3af;font-size:12px;margin:28px 0 0">
+      If you didn't request a password reset, you can safely ignore this email.
+      Your password will not change.
+    </p>
+  </div>
+</body>
+</html>
+"""
+    _send(to, "Reset your CertMind password", html)
