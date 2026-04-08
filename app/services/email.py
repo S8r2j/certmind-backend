@@ -1,42 +1,43 @@
 """
 Email service — verification and password reset emails.
 
-Uses SMTP with STARTTLS (works with Gmail, Brevo, Mailgun, etc.).
-If SMTP_HOST is not configured, the email link is logged to console
-so development works without an SMTP server.
+Uses Brevo (https://brevo.com) HTTP API — free tier: 300 emails/day.
+Works on Render and any cloud host (no SMTP ports needed).
+If BREVO_API_KEY is not set, the email link is logged to console
+so local development works without any API key.
 """
 import logging
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import httpx
 
 from app.core.config import settings
 
 log = logging.getLogger(__name__)
 
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+
 
 def _send(to: str, subject: str, html: str) -> None:
-    if not settings.smtp_host:
-        log.warning("SMTP not configured — printing email to console instead")
+    if not settings.brevo_api_key:
+        log.warning("BREVO_API_KEY not configured — printing email to console instead")
         log.info("TO: %s | SUBJECT: %s\n%s", to, subject, html)
         return
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = f"{settings.smtp_from_name} <{settings.smtp_from_email}>"
-    msg["To"] = to
-    msg.attach(MIMEText(html, "html"))
-
+    payload = {
+        "sender": {"name": settings.smtp_from_name, "email": settings.smtp_from_email},
+        "to": [{"email": to}],
+        "subject": subject,
+        "htmlContent": html,
+    }
     try:
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as s:
-            s.ehlo()
-            s.starttls()
-            s.ehlo()
-            if settings.smtp_user and settings.smtp_password:
-                s.login(settings.smtp_user, settings.smtp_password)
-            s.sendmail(settings.smtp_from_email, to, msg.as_string())
+        resp = httpx.post(
+            BREVO_API_URL,
+            json=payload,
+            headers={"api-key": settings.brevo_api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
     except Exception as exc:
-        log.error("Failed to send email to %s: %s", to, exc)
+        log.error("Failed to send email to %s — %s", to, exc, exc_info=True)
         raise
 
 

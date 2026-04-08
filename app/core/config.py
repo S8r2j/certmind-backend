@@ -23,13 +23,10 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:3000"
     bypass_subscription: bool = False  # Set to True in .env to skip payment gates during testing
 
-    # SMTP — used for email verification and password reset
-    # Leave smtp_host empty to disable sending (links printed to console instead)
-    smtp_host: str = ""
-    smtp_port: int = 587
-    smtp_user: str = ""
-    smtp_password: str = ""
-    smtp_from_email: str = "noreply@certmind.app"
+    # Brevo — HTTP email API (https://brevo.com, free tier: 300 emails/day)
+    # Leave empty to disable sending (links printed to console instead)
+    brevo_api_key: str = ""
+    smtp_from_email: str = "certmindai@gmail.com"
     smtp_from_name: str = "CertMind"
 
     class Config:
