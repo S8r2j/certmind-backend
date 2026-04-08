@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     upstash_redis_rest_url: str = ""
     upstash_redis_rest_token: str = ""
     frontend_url: str = "http://localhost:3000"
+    backend_url: str = "http://localhost:8000"
     bypass_subscription: bool = False  # Set to True in .env to skip payment gates during testing
 
     # Brevo — HTTP email API (https://brevo.com, free tier: 300 emails/day)

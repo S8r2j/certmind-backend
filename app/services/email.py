@@ -42,7 +42,7 @@ def _send(to: str, subject: str, html: str) -> None:
 
 
 def send_verification_email(to: str, token: str) -> None:
-    link = f"{settings.frontend_url}/verify-email?token={token}"
+    link = f"{settings.backend_url}/auth/verify-email?token={token}"
     html = f"""
 <!DOCTYPE html>
 <html>
@@ -69,7 +69,7 @@ def send_verification_email(to: str, token: str) -> None:
 
 
 def send_password_reset_email(to: str, token: str) -> None:
-    link = f"{settings.frontend_url}/reset-password?token={token}"
+    link = f"{settings.frontend_url}/reset-password?token={token}"  # goes directly to frontend form
     html = f"""
 <!DOCTYPE html>
 <html>
