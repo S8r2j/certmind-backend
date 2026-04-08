@@ -15,6 +15,7 @@ from app.services.redis_client import blacklist_refresh_token, is_refresh_token_
 from app.schemas.models import (
     RegisterRequest, LoginRequest, AuthResponse, RefreshRequest,
     ForgotPasswordRequest, ResetPasswordRequest, ResendVerificationRequest,
+    ProfileResponse, UpdateProfileRequest, ChangePasswordRequest,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -67,9 +68,15 @@ async def register(body: RegisterRequest):
     verify_expires = datetime.now(timezone.utc) + timedelta(hours=VERIFY_TOKEN_TTL_HOURS)
 
     execute(
-        "INSERT INTO users (id, email, password_hash, email_verified, email_verify_token, email_verify_token_expires_at) "
-        "VALUES (%s, %s, %s, FALSE, %s, %s)",
-        (user_id, body.email, hashed, verify_token, verify_expires),
+        "INSERT INTO users (id, email, password_hash, email_verified, email_verify_token, "
+        "email_verify_token_expires_at, first_name, middle_name, last_name, gender, "
+        "date_of_birth, employment_details, goals) "
+        "VALUES (%s, %s, %s, FALSE, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            user_id, body.email, hashed, verify_token, verify_expires,
+            body.first_name, body.middle_name, body.last_name, body.gender,
+            body.date_of_birth, body.employment_details, body.goals,
+        ),
     )
 
     try:
@@ -85,6 +92,8 @@ async def register(body: RegisterRequest):
         refresh_token=refresh_token,
         session_token=session_token,
         email=body.email,
+        first_name=body.first_name,
+        last_name=body.last_name,
     )
 
 
@@ -93,7 +102,7 @@ async def register(body: RegisterRequest):
 @router.post("/login", response_model=AuthResponse)
 async def login(body: LoginRequest):
     user = fetchone(
-        "SELECT id, email, password_hash, email_verified FROM users WHERE email = %s",
+        "SELECT id, email, password_hash, email_verified, first_name, last_name FROM users WHERE email = %s",
         (body.email,),
     )
     if not user:
@@ -114,6 +123,8 @@ async def login(body: LoginRequest):
         refresh_token=refresh_token,
         session_token=session_token,
         email=user["email"],
+        first_name=user.get("first_name"),
+        last_name=user.get("last_name"),
     )
 
 
@@ -258,4 +269,59 @@ async def logout(body: RefreshRequest, request: Request, user_id: str = Depends(
     if session_token:
         execute("UPDATE user_sessions SET is_active = FALSE WHERE session_token = %s", (session_token,))
 
+    return {"ok": True}
+
+
+# ── Profile ───────────────────────────────────────────────────────────────────
+
+@router.get("/profile", response_model=ProfileResponse)
+async def get_profile(request: Request, user_id: str = Depends(get_current_user)):
+    await validate_session(request, user_id)
+    user = fetchone(
+        "SELECT email, first_name, middle_name, last_name, gender, date_of_birth, "
+        "employment_details, goals FROM users WHERE id = %s",
+        (user_id,),
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    dob = user.get("date_of_birth")
+    return ProfileResponse(
+        email=user["email"],
+        first_name=user.get("first_name"),
+        middle_name=user.get("middle_name"),
+        last_name=user.get("last_name"),
+        gender=user.get("gender"),
+        date_of_birth=str(dob) if dob else None,
+        employment_details=user.get("employment_details"),
+        goals=user.get("goals"),
+    )
+
+
+@router.put("/profile", response_model=ProfileResponse)
+async def update_profile(body: UpdateProfileRequest, request: Request, user_id: str = Depends(get_current_user)):
+    await validate_session(request, user_id)
+    execute(
+        "UPDATE users SET first_name = COALESCE(%s, first_name), middle_name = %s, "
+        "last_name = COALESCE(%s, last_name), gender = %s, date_of_birth = %s, "
+        "employment_details = %s, goals = %s WHERE id = %s",
+        (
+            body.first_name, body.middle_name, body.last_name, body.gender,
+            body.date_of_birth, body.employment_details, body.goals, user_id,
+        ),
+    )
+    return await get_profile(request, user_id)
+
+
+@router.post("/change-password")
+async def change_password(body: ChangePasswordRequest, request: Request, user_id: str = Depends(get_current_user)):
+    await validate_session(request, user_id)
+    user = fetchone("SELECT password_hash FROM users WHERE id = %s", (user_id,))
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        ph.verify(user["password_hash"], body.current_password)
+    except VerifyMismatchError:
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    new_hash = ph.hash(body.new_password)
+    execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hash, user_id))
     return {"ok": True}

@@ -5,6 +5,13 @@ from typing import Optional
 class RegisterRequest(BaseModel):
     email: str
     password: str = Field(..., min_length=8)
+    first_name: str = Field(..., min_length=1, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    gender: Optional[str] = None
+    date_of_birth: Optional[str] = None       # ISO date string: YYYY-MM-DD
+    employment_details: Optional[str] = None
+    goals: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -17,6 +24,34 @@ class AuthResponse(BaseModel):
     refresh_token: str
     session_token: str
     email: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+
+class ProfileResponse(BaseModel):
+    email: str
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    last_name: Optional[str] = None
+    gender: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    employment_details: Optional[str] = None
+    goals: Optional[str] = None
+
+
+class UpdateProfileRequest(BaseModel):
+    first_name: Optional[str] = Field(None, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
+    last_name: Optional[str] = Field(None, max_length=100)
+    gender: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    employment_details: Optional[str] = None
+    goals: Optional[str] = None
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(..., min_length=8)
 
 
 class RefreshRequest(BaseModel):
