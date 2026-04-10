@@ -21,17 +21,22 @@ SET_SIZE = 50   # questions per shared set / per session
 
 # ── Subscription gate ─────────────────────────────────────────────────────────
 
-def _ensure_trial_or_raise(user_id: str, exam_slug: str) -> None:
+TRIAL_DAYS = 3
+TRIAL_QUESTION_LIMIT = 25
+
+
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _ensure_trial_or_raise(user_id: str, exam_slug: str, client_ip: str) -> None:
     user = fetchone("SELECT trial_used FROM users WHERE id = %s", (user_id,))
-    if user and not user["trial_used"]:
-        trial_expires = datetime.now(timezone.utc) + timedelta(days=7)
-        execute(
-            "INSERT INTO user_subscriptions (id, user_id, exam_slug, status, expires_at) "
-            "VALUES (%s, %s, %s, 'trial', %s)",
-            (str(uuid.uuid4()), user_id, exam_slug, trial_expires),
-        )
-        execute("UPDATE users SET trial_used = TRUE WHERE id = %s", (user_id,))
-    else:
+
+    if not user or user["trial_used"]:
+        # Trial already used for this account — check if they're enrolled elsewhere (during trial)
         other = fetchone(
             "SELECT exam_slug FROM user_subscriptions "
             "WHERE user_id = %s AND exam_slug != %s AND status IN ('active', 'trial') "
@@ -43,17 +48,32 @@ def _ensure_trial_or_raise(user_id: str, exam_slug: str) -> None:
                 status_code=403,
                 detail=f"ENROLLED_ELSEWHERE|{other['exam_slug']}",
             )
-        raise HTTPException(
-            status_code=403,
-            detail="No active subscription for this exam. Your free trial has been used.",
-        )
+        raise HTTPException(status_code=403, detail="TRIAL_USED|NO_SUBSCRIPTION")
+
+    # IP check: has this IP already been used for a trial on any account?
+    ip_row = fetchone("SELECT ip FROM trial_ips WHERE ip = %s", (client_ip,))
+    if ip_row:
+        raise HTTPException(status_code=403, detail="TRIAL_IP_USED")
+
+    # Grant 3-day trial for this exam on this account
+    trial_expires = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+    execute(
+        "INSERT INTO user_subscriptions (id, user_id, exam_slug, status, expires_at) "
+        "VALUES (%s, %s, %s, 'trial', %s)",
+        (str(uuid.uuid4()), user_id, exam_slug, trial_expires),
+    )
+    execute("UPDATE users SET trial_used = TRUE WHERE id = %s", (user_id,))
+    execute(
+        "INSERT INTO trial_ips (ip) VALUES (%s) ON CONFLICT DO NOTHING",
+        (client_ip,),
+    )
 
 
-def _check_subscription(user_id: str, exam_slug: str) -> None:
+def _check_subscription(user_id: str, exam_slug: str, client_ip: str) -> None:
     if settings.bypass_subscription:
         return
     sub = fetchone(
-        "SELECT id, expires_at FROM user_subscriptions "
+        "SELECT id, expires_at, status FROM user_subscriptions "
         "WHERE user_id = %s AND exam_slug = %s AND status IN ('active', 'trial') "
         "ORDER BY expires_at DESC LIMIT 1",
         (user_id, exam_slug),
@@ -70,9 +90,19 @@ def _check_subscription(user_id: str, exam_slug: str) -> None:
                 "WHERE user_id = %s AND exam_slug = %s AND status IN ('active', 'trial')",
                 (user_id, exam_slug),
             )
-            _ensure_trial_or_raise(user_id, exam_slug)
+            _ensure_trial_or_raise(user_id, exam_slug, client_ip)
+            return
+        # Enforce 25-question cap during trial
+        if sub["status"] == "trial":
+            answered = fetchone(
+                "SELECT COUNT(*) AS cnt FROM user_question_attempts "
+                "WHERE user_id = %s AND exam_slug = %s",
+                (user_id, exam_slug),
+            )
+            if answered and answered["cnt"] >= TRIAL_QUESTION_LIMIT:
+                raise HTTPException(status_code=403, detail="TRIAL_LIMIT_REACHED")
     else:
-        _ensure_trial_or_raise(user_id, exam_slug)
+        _ensure_trial_or_raise(user_id, exam_slug, client_ip)
 
 
 # ── Domain selection ──────────────────────────────────────────────────────────
@@ -236,7 +266,7 @@ async def get_question(
     user_id: str = Depends(get_current_user),
 ):
     await validate_session(request, user_id)
-    _check_subscription(user_id, body.exam_slug)
+    _check_subscription(user_id, body.exam_slug, _get_client_ip(request))
 
     progress = fetchone(
         "SELECT domain_scores, questions_seen FROM user_progress "
