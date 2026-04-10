@@ -154,3 +154,8 @@ class CreateCourseRequest(BaseModel):
     code: str = Field(..., min_length=2, max_length=20)
     description: Optional[str] = None
     domains: List[dict] = []   # [{"name": "...", "weight": 0.25}, ...]
+
+
+class ExtendTrialRequest(BaseModel):
+    days: int = Field(..., ge=1, le=90)
+    exam_slug: str = ""  # required only when no trial exists yet for the user
