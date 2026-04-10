@@ -1,11 +1,15 @@
+import asyncio
+import csv
+import io
 import json
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import Response, StreamingResponse
 from app.middleware.auth import get_current_user
 from app.middleware.session import validate_session
 from app.services.database import fetchone, fetchall, execute
 from app.schemas.models import CouponResponse, CreateCouponRequest, CreateCourseRequest
-from app.services.ai import EXAM_METADATA
+from app.services.ai import EXAM_METADATA, enrich_question
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -212,3 +216,207 @@ async def get_stats(admin_id: str = Depends(require_admin)):
         "questions_total": questions_total["cnt"] if questions_total else 0,
         "attempts_total": attempts_total["cnt"] if attempts_total else 0,
     }
+
+
+# ── CSV Import ────────────────────────────────────────────────────────────────
+
+_REQUIRED_COLS = {"stem", "correct_answer"}
+_FULL_COLS = {"stem", "option_a", "option_b", "option_c", "option_d", "correct_answer"}
+_VALID_ANSWERS = {"A", "B", "C", "D"}
+
+_FULL_TEMPLATE_ROW = {
+    "stem": "Which AWS service provides managed relational database hosting?",
+    "option_a": "Amazon DynamoDB",
+    "option_b": "Amazon RDS",
+    "option_c": "Amazon Redshift",
+    "option_d": "Amazon ElastiCache",
+    "correct_answer": "B",
+    "explanation": "Amazon RDS manages relational databases like MySQL, PostgreSQL, etc.",
+    "option_explanation_a": "Incorrect — DynamoDB is a NoSQL key-value store.",
+    "option_explanation_b": "Correct — RDS provides managed relational database engines.",
+    "option_explanation_c": "Incorrect — Redshift is a data warehouse service.",
+    "option_explanation_d": "Incorrect — ElastiCache is an in-memory caching service.",
+    "domain": "Cloud Technology and Services",
+    "difficulty": "easy",
+}
+_MINIMAL_TEMPLATE_ROW = {
+    "stem": "What does S3 stand for in AWS?",
+    "correct_answer": "A",
+    "domain": "Cloud Technology and Services",
+}
+
+
+def _validate_csv(content: bytes) -> tuple[list[dict], str | None]:
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return [], "File is not valid UTF-8. Save your CSV as UTF-8 and try again."
+
+    reader = csv.DictReader(io.StringIO(text))
+    if reader.fieldnames is None:
+        return [], "CSV appears to be empty — no header row found."
+
+    cols = {c.strip().lower() for c in reader.fieldnames}
+    missing = _REQUIRED_COLS - cols
+    if missing:
+        return [], f"CSV is missing required column(s): {', '.join(sorted(missing))}"
+
+    rows = []
+    for i, row in enumerate(reader, start=2):  # row 1 is header
+        stem = (row.get("stem") or "").strip()
+        answer = (row.get("correct_answer") or "").strip().upper()
+        if not stem:
+            return [], f"Row {i}: 'stem' is empty."
+        if answer not in _VALID_ANSWERS:
+            return [], f"Row {i}: 'correct_answer' must be A, B, C or D — got '{answer}'."
+        rows.append({k.strip().lower(): (v or "").strip() for k, v in row.items()})
+
+    if not rows:
+        return [], "CSV has a header but no data rows."
+
+    return rows, None
+
+
+def _find_import_set_number(exam_slug: str) -> int:
+    """Return the set_number to use for imported questions (first set with < 50 questions)."""
+    row = fetchone(
+        "SELECT set_number, COUNT(*) AS cnt FROM questions "
+        "WHERE exam_slug = %s AND is_active = TRUE "
+        "GROUP BY set_number ORDER BY set_number DESC LIMIT 1",
+        (exam_slug,),
+    )
+    if not row:
+        return 1
+    if row["cnt"] < 50:
+        return row["set_number"]
+    return row["set_number"] + 1
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+async def _stream_import(exam_slug: str, rows: list[dict]):
+    total = len(rows)
+    inserted = skipped = errors = 0
+
+    yield _sse({"step": "validating", "message": f"Validation passed — {total} row(s) ready.", "current": 0, "total": total, "inserted": 0, "skipped": 0, "errors": 0})
+
+    set_number = await asyncio.to_thread(_find_import_set_number, exam_slug)
+
+    for i, row in enumerate(rows, start=1):
+        stem = row["stem"]
+        correct_answer = row["correct_answer"].upper()
+        domain = row.get("domain", "")
+        difficulty = row.get("difficulty", "medium") or "medium"
+
+        # Duplicate check
+        dup = await asyncio.to_thread(
+            fetchone,
+            "SELECT id FROM questions WHERE exam_slug = %s AND LOWER(stem) = LOWER(%s)",
+            (exam_slug, stem),
+        )
+        if dup:
+            skipped += 1
+            yield _sse({"step": "processing", "message": f"Row {i}: skipped (duplicate stem).", "current": i, "total": total, "row_index": i, "mode": "skip", "inserted": inserted, "skipped": skipped, "errors": errors})
+            continue
+
+        # Detect mode
+        is_full = all(row.get(f"option_{k.lower()}") for k in ["a", "b", "c", "d"])
+        mode = "full" if is_full else "minimal"
+
+        if mode == "full":
+            options = [
+                {"key": "A", "text": row["option_a"]},
+                {"key": "B", "text": row["option_b"]},
+                {"key": "C", "text": row["option_c"]},
+                {"key": "D", "text": row["option_d"]},
+            ]
+            explanation = row.get("explanation", "")
+            option_explanations = {
+                "A": row.get("option_explanation_a", ""),
+                "B": row.get("option_explanation_b", ""),
+                "C": row.get("option_explanation_c", ""),
+                "D": row.get("option_explanation_d", ""),
+            }
+            yield _sse({"step": "processing", "message": f"Row {i}: inserting (full mode).", "current": i, "total": total, "row_index": i, "mode": mode, "inserted": inserted, "skipped": skipped, "errors": errors})
+        else:
+            yield _sse({"step": "processing", "message": f"Row {i}: enriching with AI (minimal mode)…", "current": i, "total": total, "row_index": i, "mode": mode, "inserted": inserted, "skipped": skipped, "errors": errors})
+            try:
+                enriched = await asyncio.to_thread(enrich_question, stem, correct_answer, exam_slug, domain)
+                options = enriched["options"]
+                explanation = enriched.get("explanation", "")
+                option_explanations = enriched.get("option_explanations", {})
+            except Exception as exc:
+                errors += 1
+                yield _sse({"step": "processing", "message": f"Row {i}: AI enrichment failed — {exc}.", "current": i, "total": total, "row_index": i, "mode": mode, "inserted": inserted, "skipped": skipped, "errors": errors})
+                continue
+
+        try:
+            await asyncio.to_thread(
+                execute,
+                "INSERT INTO questions (id, exam_slug, domain, stem, options, correct_answer, "
+                "explanation, option_explanations, difficulty, set_number) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    str(uuid.uuid4()), exam_slug, domain, stem,
+                    json.dumps(options), correct_answer,
+                    explanation, json.dumps(option_explanations),
+                    difficulty, set_number,
+                ),
+            )
+            inserted += 1
+            yield _sse({"step": "processing", "message": f"Row {i}: inserted successfully.", "current": i, "total": total, "row_index": i, "mode": mode, "inserted": inserted, "skipped": skipped, "errors": errors})
+        except Exception as exc:
+            errors += 1
+            yield _sse({"step": "processing", "message": f"Row {i}: DB insert failed — {exc}.", "current": i, "total": total, "row_index": i, "mode": mode, "inserted": inserted, "skipped": skipped, "errors": errors})
+
+    yield _sse({"step": "done", "message": "Import complete.", "current": total, "total": total, "inserted": inserted, "skipped": skipped, "errors": errors})
+
+
+@router.post("/import-questions")
+async def import_questions(
+    exam_slug: str = Form(...),
+    file: UploadFile = File(...),
+    admin_id: str = Depends(require_admin),
+):
+    content = await file.read()
+    rows, error = _validate_csv(content)
+    if error:
+        async def _error_stream():
+            yield _sse({"step": "error", "message": error, "current": 0, "total": -1, "inserted": 0, "skipped": 0, "errors": 1})
+        return StreamingResponse(_error_stream(), media_type="text/event-stream")
+
+    return StreamingResponse(_stream_import(exam_slug, rows), media_type="text/event-stream")
+
+
+@router.get("/import-template/{exam_slug}")
+async def import_template(
+    exam_slug: str,
+    admin_id: str = Depends(require_admin),
+):
+    full_headers = [
+        "stem", "option_a", "option_b", "option_c", "option_d",
+        "correct_answer", "explanation",
+        "option_explanation_a", "option_explanation_b",
+        "option_explanation_c", "option_explanation_d",
+        "domain", "difficulty",
+    ]
+    minimal_headers = ["stem", "correct_answer", "domain"]
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=full_headers, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerow(_FULL_TEMPLATE_ROW)
+
+    # Minimal row — fill missing full columns with empty string
+    minimal_row = {h: "" for h in full_headers}
+    minimal_row.update(_MINIMAL_TEMPLATE_ROW)
+    writer.writerow(minimal_row)
+
+    csv_bytes = buf.getvalue().encode("utf-8-sig")
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=import-template-{exam_slug}.csv"},
+    )
