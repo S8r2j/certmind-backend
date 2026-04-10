@@ -74,6 +74,7 @@ class ChangePasswordRequest(BaseModel):
 
 class QuestionRequest(BaseModel):
     exam_slug: str
+    tab_id: str = ""
 
 
 class AnswerRequest(BaseModel):

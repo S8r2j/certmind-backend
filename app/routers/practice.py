@@ -265,6 +265,29 @@ def _prefetch_question_for_user(user_id: str, exam_slug: str) -> None:
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+@router.get("/session-status")
+async def get_session_status(
+    exam_slug: str,
+    request: Request,
+    user_id: str = Depends(get_current_user),
+):
+    await validate_session(request, user_id)
+    session = fetchone(
+        "SELECT id, set_number, questions_answered, is_complete FROM practice_sessions "
+        "WHERE user_id = %s AND exam_slug = %s AND is_complete = FALSE "
+        "ORDER BY created_at DESC LIMIT 1",
+        (user_id, exam_slug),
+    )
+    if not session or session["questions_answered"] == 0:
+        return {"active": False}
+    return {
+        "active": True,
+        "questions_answered": session["questions_answered"],
+        "set_size": _set_size(),
+        "set_number": session["set_number"],
+    }
+
+
 @router.post("/question")
 async def get_question(
     body: QuestionRequest,
@@ -285,6 +308,30 @@ async def get_question(
     session = _get_or_create_practice_session(user_id, body.exam_slug, questions_seen)
     set_number = session["set_number"]
     questions_answered = session["questions_answered"]
+
+    # Tab-level lock: reject if another tab claimed this session in the last 30s
+    if body.tab_id:
+        lock_row = fetchone(
+            "SELECT active_tab_id, last_active_at FROM practice_sessions WHERE id = %s",
+            (session["id"],),
+        )
+        if lock_row:
+            existing_tab = lock_row["active_tab_id"]
+            last_active = lock_row["last_active_at"]
+            if existing_tab and existing_tab != body.tab_id and last_active:
+                if isinstance(last_active, str):
+                    from datetime import datetime as _dt
+                    last_active = _dt.fromisoformat(last_active.replace("Z", "+00:00"))
+                if last_active.tzinfo is None:
+                    last_active = last_active.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - last_active).total_seconds()
+                if age < 30:
+                    raise HTTPException(status_code=403, detail="SESSION_ACTIVE_ELSEWHERE")
+        # Claim the session for this tab
+        execute(
+            "UPDATE practice_sessions SET active_tab_id = %s WHERE id = %s",
+            (body.tab_id, session["id"]),
+        )
 
     if questions_answered >= _set_size():
         _mark_session_complete(session["id"])
