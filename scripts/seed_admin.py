@@ -25,10 +25,9 @@ from app.services.database import init_pool, execute, fetchone
 
 
 def _hash_password(password: str) -> str:
-    """Match the bcrypt hashing used in auth.py."""
-    from passlib.context import CryptContext
-    ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-    return ctx.hash(password)
+    """Match the argon2 hashing used in auth.py."""
+    from argon2 import PasswordHasher
+    return PasswordHasher().hash(password)
 
 
 def promote(email: str) -> None:
@@ -64,7 +63,7 @@ def create_admin(email: str, password: str) -> None:
     hashed = _hash_password(password)
     user_id = str(uuid.uuid4())
     execute(
-        "INSERT INTO users (id, email, hashed_password, is_verified, is_admin, trial_used) "
+        "INSERT INTO users (id, email, password_hash, email_verified, is_admin, trial_used) "
         "VALUES (%s, %s, %s, TRUE, TRUE, TRUE)",
         (user_id, email, hashed),
     )
