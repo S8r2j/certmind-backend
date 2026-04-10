@@ -11,6 +11,7 @@ from app.middleware.session import validate_session
 from app.services.database import fetchone, fetchall, execute
 from app.schemas.models import CouponResponse, CreateCouponRequest, CreateCourseRequest, ExtendTrialRequest
 from app.services.ai import EXAM_METADATA, enrich_question
+from app.services.platform_settings import get_all_settings, set_setting
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -257,6 +258,28 @@ async def get_stats(admin_id: str = Depends(require_admin)):
         "questions_total": questions_total["cnt"] if questions_total else 0,
         "attempts_total": attempts_total["cnt"] if attempts_total else 0,
     }
+
+
+# ── Platform Settings ────────────────────────────────────────────────────────
+
+@router.get("/settings")
+async def list_settings(admin_id: str = Depends(require_admin)):
+    """Return all platform settings."""
+    return get_all_settings()
+
+
+@router.put("/settings/{key}")
+async def update_setting(
+    key: str,
+    body: dict,
+    admin_id: str = Depends(require_admin),
+):
+    """Update a single platform setting by key."""
+    value = body.get("value")
+    if value is None:
+        raise HTTPException(status_code=400, detail="'value' field is required")
+    set_setting(key, str(value))
+    return {"key": key, "value": str(value)}
 
 
 # ── CSV Import ────────────────────────────────────────────────────────────────

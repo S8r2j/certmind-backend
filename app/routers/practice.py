@@ -13,16 +13,22 @@ from app.services.redis_client import (
 )
 from app.schemas.models import QuestionRequest, AnswerRequest
 from app.core.config import settings
+from app.services.platform_settings import get_int
 
 router = APIRouter(prefix="/practice", tags=["practice"])
 
-SET_SIZE = 50   # questions per shared set / per session
+
+def _set_size() -> int:
+    return get_int("session_set_size", 50)
+
+def _trial_days() -> int:
+    return get_int("trial_days", 3)
+
+def _trial_question_limit() -> int:
+    return get_int("trial_question_limit", 25)
 
 
 # ── Subscription gate ─────────────────────────────────────────────────────────
-
-TRIAL_DAYS = 3
-TRIAL_QUESTION_LIMIT = 25
 
 
 def _get_client_ip(request: Request) -> str:
@@ -55,8 +61,8 @@ def _ensure_trial_or_raise(user_id: str, exam_slug: str, client_ip: str) -> None
     if ip_row:
         raise HTTPException(status_code=403, detail="TRIAL_IP_USED")
 
-    # Grant 3-day trial for this exam on this account
-    trial_expires = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+    # Grant trial for this exam on this account
+    trial_expires = datetime.now(timezone.utc) + timedelta(days=_trial_days())
     execute(
         "INSERT INTO user_subscriptions (id, user_id, exam_slug, status, expires_at) "
         "VALUES (%s, %s, %s, 'trial', %s)",
@@ -92,14 +98,14 @@ def _check_subscription(user_id: str, exam_slug: str, client_ip: str) -> None:
             )
             _ensure_trial_or_raise(user_id, exam_slug, client_ip)
             return
-        # Enforce 25-question cap during trial
+        # Enforce question cap during trial
         if sub["status"] == "trial":
             answered = fetchone(
                 "SELECT COUNT(*) AS cnt FROM user_question_attempts "
                 "WHERE user_id = %s AND exam_slug = %s",
                 (user_id, exam_slug),
             )
-            if answered and answered["cnt"] >= TRIAL_QUESTION_LIMIT:
+            if answered and answered["cnt"] >= _trial_question_limit():
                 raise HTTPException(status_code=403, detail="TRIAL_LIMIT_REACHED")
     else:
         _ensure_trial_or_raise(user_id, exam_slug, client_ip)
@@ -139,7 +145,7 @@ def _find_set_for_new_session(exam_slug: str, questions_seen: list) -> int:
     seen_set = set(questions_seen)
     for row in rows:
         sn, cnt = row["set_number"], row["cnt"]
-        if cnt < SET_SIZE:
+        if cnt < _set_size():
             return sn
         ids = fetchall(
             "SELECT id FROM questions WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE",
@@ -280,7 +286,7 @@ async def get_question(
     set_number = session["set_number"]
     questions_answered = session["questions_answered"]
 
-    if questions_answered >= SET_SIZE:
+    if questions_answered >= _set_size():
         _mark_session_complete(session["id"])
         raise HTTPException(status_code=200, detail="SESSION_COMPLETE")
 
@@ -290,7 +296,7 @@ async def get_question(
             q["option_explanations"] = {}
         q["session_progress"] = {
             "answered": questions_answered,
-            "total": SET_SIZE,
+            "total": _set_size(),
             "set_number": set_number,
         }
         return q
@@ -326,7 +332,7 @@ async def get_question(
         "SELECT COUNT(*) AS cnt FROM questions WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE",
         (body.exam_slug, set_number),
     )
-    if set_count and set_count["cnt"] >= SET_SIZE:
+    if set_count and set_count["cnt"] >= _set_size():
         _mark_session_complete(session["id"])
         raise HTTPException(status_code=200, detail="SESSION_COMPLETE")
 
@@ -440,7 +446,7 @@ async def submit_answer(
     session_complete = False
     if session:
         new_count = _increment_session(session["id"], time_spent)
-        if new_count >= SET_SIZE:
+        if new_count >= _set_size():
             _mark_session_complete(session["id"])
             session_complete = True
 

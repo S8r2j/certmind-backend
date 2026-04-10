@@ -7,6 +7,7 @@ from app.middleware.session import validate_session
 from app.services.database import fetchone, execute
 from app.core.config import settings
 from app.schemas.models import CheckoutRequest
+from app.services.platform_settings import get_int as _get_int
 
 router = APIRouter(prefix="/payment", tags=["payment"])
 stripe.api_key = settings.stripe_secret_key
@@ -87,7 +88,7 @@ async def create_checkout(
 
     session = stripe.checkout.Session.create(**checkout_params)
 
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=_get_int("subscription_days", 7))
     execute(
         "INSERT INTO user_subscriptions (id, user_id, exam_slug, stripe_session_id, status, expires_at) "
         "VALUES (%s, %s, %s, %s, 'pending', %s)",
@@ -110,7 +111,7 @@ async def stripe_webhook(request: Request):
         if s.get("payment_status") == "paid":
             user_id = s["metadata"]["user_id"]
             exam_slug = s["metadata"]["exam_slug"]
-            expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+            expires_at = datetime.now(timezone.utc) + timedelta(days=_get_int("subscription_days", 7))
             execute(
                 "UPDATE user_subscriptions SET status = 'active', expires_at = %s, "
                 "stripe_payment_intent_id = %s WHERE stripe_session_id = %s",
