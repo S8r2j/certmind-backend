@@ -54,6 +54,7 @@ class ProfileResponse(BaseModel):
     date_of_birth: Optional[str] = None
     employment_details: Optional[str] = None
     goals: Optional[str] = None
+    is_admin: bool = False
 
 
 class UpdateProfileRequest(BaseModel):

@@ -280,7 +280,7 @@ async def get_profile(request: Request, user_id: str = Depends(get_current_user)
     await validate_session(request, user_id)
     user = fetchone(
         "SELECT email, first_name, middle_name, last_name, gender, date_of_birth, "
-        "employment_details, goals FROM users WHERE id = %s",
+        "employment_details, goals, is_admin FROM users WHERE id = %s",
         (user_id,),
     )
     if not user:
@@ -295,6 +295,7 @@ async def get_profile(request: Request, user_id: str = Depends(get_current_user)
         date_of_birth=str(dob) if dob else None,
         employment_details=user.get("employment_details"),
         goals=user.get("goals"),
+        is_admin=bool(user.get("is_admin", False)),
     )
 
 
