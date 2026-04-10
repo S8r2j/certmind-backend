@@ -68,6 +68,41 @@ def send_verification_email(to: str, token: str) -> None:
     _send(to, "Verify your CertMind email", html)
 
 
+def send_expiry_reminder_email(to: str, exam_slug: str, expires_at_iso: str) -> None:
+    """Send a 'your subscription expires tomorrow' reminder email."""
+    from datetime import datetime
+    try:
+        dt = datetime.fromisoformat(expires_at_iso.replace("Z", "+00:00"))
+        expires_str = dt.strftime("%B %d, %Y at %H:%M UTC")
+    except Exception:
+        expires_str = expires_at_iso
+
+    html = f"""
+<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif;background:#f8f9fa;padding:40px 0">
+  <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;border:1px solid #e5e7eb;padding:40px">
+    <h1 style="margin:0 0 4px;font-size:22px;color:#111">Your access expires soon</h1>
+    <p style="color:#6b7280;margin:0 0 28px;font-size:14px">CertMind — {exam_slug.replace('-', ' ').title()}</p>
+    <p style="color:#374151;font-size:14px;margin:0 0 24px">
+      Your CertMind access for <strong>{exam_slug.replace('-', ' ').title()}</strong> expires on
+      <strong>{expires_str}</strong>. After that you will need to purchase a new subscription.
+    </p>
+    <a href="{settings.frontend_url}/dashboard"
+       style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;
+              font-weight:600;font-size:14px;padding:12px 28px;border-radius:8px">
+      Continue Studying →
+    </a>
+    <p style="color:#9ca3af;font-size:12px;margin:28px 0 0">
+      Make the most of your remaining time — good luck on your exam!
+    </p>
+  </div>
+</body>
+</html>
+"""
+    _send(to, "Your CertMind access expires tomorrow", html)
+
+
 def send_password_reset_email(to: str, token: str) -> None:
     link = f"{settings.frontend_url}/reset-password?token={token}"  # goes directly to frontend form
     html = f"""
