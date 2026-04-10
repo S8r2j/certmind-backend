@@ -3,12 +3,13 @@ import csv
 import io
 import json
 import uuid
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from app.middleware.auth import get_current_user
 from app.middleware.session import validate_session
 from app.services.database import fetchone, fetchall, execute
-from app.schemas.models import CouponResponse, CreateCouponRequest, CreateCourseRequest
+from app.schemas.models import CouponResponse, CreateCouponRequest, CreateCourseRequest, ExtendTrialRequest
 from app.services.ai import EXAM_METADATA, enrich_question
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -60,6 +61,46 @@ async def list_users(admin_id: str = Depends(require_admin)):
                 "expires_at": r["expires_at"].isoformat() if hasattr(r["expires_at"], "isoformat") else str(r["expires_at"]),
             })
     return list(users.values())
+
+
+# ── Extend trial ─────────────────────────────────────────────────────────────
+
+@router.post("/users/{user_id}/extend-trial")
+async def extend_trial(
+    user_id: str,
+    body: ExtendTrialRequest,
+    admin_id: str = Depends(require_admin),
+):
+    """Extend (or create) a trial subscription for a user."""
+    row = fetchone(
+        "SELECT id, expires_at FROM user_subscriptions "
+        "WHERE user_id = %s AND status = 'trial' ORDER BY expires_at DESC LIMIT 1",
+        (user_id,),
+    )
+    now = datetime.now(timezone.utc)
+    if row:
+        current = row["expires_at"]
+        if isinstance(current, str):
+            current = datetime.fromisoformat(current.replace("Z", "+00:00"))
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        base = max(current, now)
+        new_expires = base + timedelta(days=body.days)
+        execute(
+            "UPDATE user_subscriptions SET expires_at = %s, status = 'trial' WHERE id = %s",
+            (new_expires, row["id"]),
+        )
+    else:
+        if not body.exam_slug:
+            raise HTTPException(status_code=400, detail="exam_slug is required when no trial exists")
+        new_expires = now + timedelta(days=body.days)
+        execute(
+            "INSERT INTO user_subscriptions (id, user_id, exam_slug, status, expires_at) "
+            "VALUES (%s, %s, %s, 'trial', %s)",
+            (str(uuid.uuid4()), user_id, body.exam_slug, new_expires),
+        )
+        execute("UPDATE users SET trial_used = TRUE WHERE id = %s", (user_id,))
+    return {"ok": True, "new_expires_at": new_expires.isoformat()}
 
 
 # ── Coupons ───────────────────────────────────────────────────────────────────
