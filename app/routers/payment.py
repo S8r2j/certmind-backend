@@ -72,23 +72,6 @@ async def create_checkout(
 ):
     await validate_session(request, user_id)
 
-    existing = fetchone(
-        "SELECT exam_slug, expires_at FROM user_subscriptions "
-        "WHERE user_id = %s AND status = 'active' ORDER BY expires_at DESC LIMIT 1",
-        (user_id,),
-    )
-    if existing:
-        expires = existing["expires_at"]
-        if isinstance(expires, str):
-            expires = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
-        if expires > datetime.now(timezone.utc):
-            raise HTTPException(
-                status_code=409,
-                detail=f"ACTIVE_SUBSCRIPTION_EXISTS|{existing['exam_slug']}|{expires.isoformat()}",
-            )
-
     stripe_coupon_id = _resolve_coupon(body.coupon_code)
 
     checkout_params: dict = dict(
@@ -104,7 +87,7 @@ async def create_checkout(
 
     session = stripe.checkout.Session.create(**checkout_params)
 
-    expires_at = datetime.now(timezone.utc) + timedelta(days=14)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     execute(
         "INSERT INTO user_subscriptions (id, user_id, exam_slug, stripe_session_id, status, expires_at) "
         "VALUES (%s, %s, %s, %s, 'pending', %s)",
@@ -127,7 +110,7 @@ async def stripe_webhook(request: Request):
         if s.get("payment_status") == "paid":
             user_id = s["metadata"]["user_id"]
             exam_slug = s["metadata"]["exam_slug"]
-            expires_at = datetime.now(timezone.utc) + timedelta(days=14)
+            expires_at = datetime.now(timezone.utc) + timedelta(days=7)
             execute(
                 "UPDATE user_subscriptions SET status = 'active', expires_at = %s, "
                 "stripe_payment_intent_id = %s WHERE stripe_session_id = %s",
