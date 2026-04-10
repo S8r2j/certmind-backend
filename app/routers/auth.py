@@ -59,7 +59,7 @@ def _make_session(user_id: str) -> str:
 
 @router.post("/register", response_model=AuthResponse)
 async def register(body: RegisterRequest):
-    if fetchone("SELECT id FROM users WHERE email = %s", (body.email,)):
+    if fetchone("SELECT id FROM users WHERE email = %s AND deleted_at IS NULL", (body.email,)):
         raise HTTPException(status_code=409, detail="Email already registered")
 
     user_id = str(uuid.uuid4())
@@ -102,7 +102,8 @@ async def register(body: RegisterRequest):
 @router.post("/login", response_model=AuthResponse)
 async def login(body: LoginRequest):
     user = fetchone(
-        "SELECT id, email, password_hash, email_verified, first_name, last_name FROM users WHERE email = %s",
+        "SELECT id, email, password_hash, email_verified, first_name, last_name FROM users "
+        "WHERE email = %s AND deleted_at IS NULL",
         (body.email,),
     )
     if not user:
@@ -324,4 +325,41 @@ async def change_password(body: ChangePasswordRequest, request: Request, user_id
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     new_hash = ph.hash(body.new_password)
     execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hash, user_id))
+    return {"ok": True}
+
+
+# ── Delete account ────────────────────────────────────────────────────────────
+
+@router.delete("/account")
+async def delete_account(request: Request, user_id: str = Depends(get_current_user)):
+    """
+    Soft-delete the authenticated user's account.
+
+    - Anonymises the email so the same address can be used to register again.
+    - Sets deleted_at timestamp (record kept for audit / financial history).
+    - Invalidates all active sessions so no further API calls can be made.
+    - Subscriptions, attempts, and progress rows are retained for records.
+    """
+    await validate_session(request, user_id)
+
+    user = fetchone("SELECT id FROM users WHERE id = %s AND deleted_at IS NULL", (user_id,))
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Anonymise email → frees it for re-registration while preserving the row
+    ghost_email = f"deleted_{user_id}@deleted.invalid"
+    execute(
+        "UPDATE users SET "
+        "  email = %s, "
+        "  password_hash = '', "
+        "  email_verify_token = NULL, "
+        "  reset_token = NULL, "
+        "  deleted_at = NOW() "
+        "WHERE id = %s",
+        (ghost_email, user_id),
+    )
+
+    # Kill all sessions immediately
+    execute("UPDATE user_sessions SET is_active = FALSE WHERE user_id = %s", (user_id,))
+
     return {"ok": True}
