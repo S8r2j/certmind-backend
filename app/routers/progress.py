@@ -74,7 +74,7 @@ async def get_attempts(
             a.attempted_at,
             q.stem, q.options, q.correct_answer, q.option_explanations
         FROM user_question_attempts a
-        JOIN questions q ON q.id = a.question_id
+        JOIN questions q ON q.id::text = a.question_id
         WHERE {where}
         ORDER BY a.attempted_at DESC
         LIMIT %s OFFSET %s
