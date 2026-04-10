@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 
 
 class RegisterRequest(BaseModel):
@@ -9,7 +9,7 @@ class RegisterRequest(BaseModel):
     middle_name: Optional[str] = Field(None, max_length=100)
     last_name: str = Field(..., min_length=1, max_length=100)
     gender: Optional[str] = None
-    date_of_birth: Optional[str] = None       # ISO date string: YYYY-MM-DD
+    date_of_birth: Optional[str] = None
     employment_details: Optional[str] = None
     goals: Optional[str] = None
 
@@ -26,6 +26,23 @@ class AuthResponse(BaseModel):
     email: str
     first_name: Optional[str] = None
     last_name: Optional[str] = None
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=8)
+
+
+class ResendVerificationRequest(BaseModel):
+    email: str
 
 
 class ProfileResponse(BaseModel):
@@ -54,23 +71,6 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=8)
 
 
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
-
-class ForgotPasswordRequest(BaseModel):
-    email: str
-
-
-class ResetPasswordRequest(BaseModel):
-    token: str
-    new_password: str = Field(..., min_length=8)
-
-
-class ResendVerificationRequest(BaseModel):
-    email: str
-
-
 class QuestionRequest(BaseModel):
     exam_slug: str
 
@@ -79,16 +79,18 @@ class AnswerRequest(BaseModel):
     exam_slug: str
     question_id: str
     answer: str = Field(..., min_length=1, max_length=1)
+    time_spent_seconds: Optional[int] = None
 
 
 class ChatRequest(BaseModel):
     exam_slug: str
     message: str = Field(..., min_length=1, max_length=2000)
-    session_id: Optional[str] = None  # None = start new session
+    session_id: Optional[str] = None
 
 
 class CheckoutRequest(BaseModel):
     exam_slug: str
+    coupon_code: Optional[str] = None
 
 
 class ProgressResponse(BaseModel):
@@ -96,6 +98,27 @@ class ProgressResponse(BaseModel):
     total_answered: int
     total_correct: int
     domain_scores: dict
+    streak_days: int = 0
+    time_committed_seconds: int = 0
+
+
+class AttemptItem(BaseModel):
+    id: str
+    question_id: str
+    stem: str
+    options: List[dict]
+    correct_answer: str
+    user_answer: str
+    option_explanations: dict
+    is_correct: bool
+    attempted_at: str
+
+
+class AttemptsResponse(BaseModel):
+    attempts: List[AttemptItem]
+    total: int
+    page: int
+    page_size: int
 
 
 class SubscriptionResponse(BaseModel):
@@ -104,3 +127,29 @@ class SubscriptionResponse(BaseModel):
     expires_at: Optional[str] = None
     days_remaining: Optional[int] = None
     is_trial: Optional[bool] = False
+
+
+class CouponResponse(BaseModel):
+    id: str
+    code: str
+    discount_pct: int
+    max_uses: Optional[int] = None
+    used_count: int
+    expires_at: Optional[str] = None
+    is_active: bool
+    stripe_coupon_id: Optional[str] = None
+
+
+class CreateCouponRequest(BaseModel):
+    code: str = Field(..., min_length=3, max_length=50)
+    discount_pct: int = Field(..., ge=1, le=100)
+    max_uses: Optional[int] = None
+    expires_at: Optional[str] = None
+
+
+class CreateCourseRequest(BaseModel):
+    slug: str = Field(..., min_length=2, max_length=100)
+    title: str = Field(..., min_length=2, max_length=200)
+    code: str = Field(..., min_length=2, max_length=20)
+    description: Optional[str] = None
+    domains: List[dict] = []   # [{"name": "...", "weight": 0.25}, ...]

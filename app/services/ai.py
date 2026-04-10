@@ -196,16 +196,21 @@ def _normalize_options(options: list) -> list:
 
 
 def generate_question(exam_slug: str, domain: str) -> dict:
-    """Synchronous call — returns parsed JSON dict with normalized options."""
+    """Synchronous call — returns parsed JSON dict with normalized options and option_explanations."""
     meta = EXAM_METADATA[exam_slug]
     domain_list = ", ".join(d["name"] for d in meta["domains"])
     prompt = (
         f"You are an expert AWS certification exam question writer for {meta['title']} ({meta['code']}).\n"
         f"Domains: {domain_list}\n"
         f'Generate ONE MCQ for domain: "{domain}", difficulty: medium.\n'
-        "Scenario-based stem, 4 options A-D, one correct answer.\n"
+        "Scenario-based stem, 4 options A-D, one correct answer. "
+        "Also explain why each option is correct or incorrect in 1-2 sentences.\n"
         "Respond ONLY in valid JSON, no markdown, no explanation outside the JSON.\n"
-        'Format: {"stem": "...", "options": [{"key": "A", "text": "..."}, {"key": "B", "text": "..."}, {"key": "C", "text": "..."}, {"key": "D", "text": "..."}], "correct_answer": "A", "explanation": "..."}'
+        'Format: {"stem": "...", '
+        '"options": [{"key": "A", "text": "..."}, {"key": "B", "text": "..."}, {"key": "C", "text": "..."}, {"key": "D", "text": "..."}], '
+        '"correct_answer": "A", '
+        '"explanation": "...", '
+        '"option_explanations": {"A": "Correct — because ...", "B": "Incorrect — because ...", "C": "Incorrect — because ...", "D": "Incorrect — because ..."}}'
     )
     provider = _provider()
     if provider == "anthropic":
@@ -215,6 +220,8 @@ def generate_question(exam_slug: str, domain: str) -> dict:
     else:
         result = _groq_generate(prompt)
     result["options"] = _normalize_options(result.get("options", []))
+    if "option_explanations" not in result or not isinstance(result["option_explanations"], dict):
+        result["option_explanations"] = {}
     return result
 
 
@@ -223,7 +230,7 @@ def _anthropic_generate(prompt: str) -> dict:
     client = _anthropic.Anthropic(api_key=settings.anthropic_api_key)
     msg = client.messages.create(
         model=_model(),
-        max_tokens=1024,
+        max_tokens=1536,
         messages=[{"role": "user", "content": prompt}],
     )
     return _parse_json(msg.content[0].text)
@@ -243,6 +250,6 @@ def _groq_generate(prompt: str) -> dict:
     resp = client.chat.completions.create(
         model=_model(),
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024,
+        max_tokens=1536,
     )
     return _parse_json(resp.choices[0].message.content or "")
