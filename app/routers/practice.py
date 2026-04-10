@@ -116,7 +116,15 @@ def _check_subscription(user_id: str, exam_slug: str, client_ip: str) -> None:
 def _select_domain(exam_slug: str, domain_scores: dict) -> str:
     meta = EXAM_METADATA.get(exam_slug)
     if not meta:
-        raise HTTPException(status_code=404, detail="Exam not found")
+        row = fetchone(
+            "SELECT domains FROM exams WHERE slug = %s AND is_active = TRUE",
+            (exam_slug,),
+        )
+        if not row or not row["domains"]:
+            raise HTTPException(status_code=404, detail="Exam not found")
+        raw = row["domains"]
+        domains = raw if isinstance(raw, list) else json.loads(raw)
+        meta = {"domains": domains}
     domains = meta["domains"]
     weights = []
     for d in domains:
