@@ -5,6 +5,7 @@ from app.middleware.session import validate_session
 from app.services.database import fetchone, execute
 from app.schemas.models import SubscriptionResponse
 from app.core.config import settings
+from app.services.platform_settings import get_int as _get_int
 
 router = APIRouter(prefix="/subscription", tags=["subscription"])
 
@@ -60,4 +61,5 @@ async def get_subscription_status(
         expires_at=expires_at.isoformat(),
         days_remaining=days_remaining,
         is_trial=is_trial,
+        trial_question_limit=_get_int("trial_question_limit", 25) if is_trial else None,
     )

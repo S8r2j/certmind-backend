@@ -129,6 +129,7 @@ class SubscriptionResponse(BaseModel):
     expires_at: Optional[str] = None
     days_remaining: Optional[int] = None
     is_trial: Optional[bool] = False
+    trial_question_limit: Optional[int] = None
 
 
 class CouponResponse(BaseModel):
