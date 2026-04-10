@@ -1,7 +1,7 @@
 import json
 import random
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from app.middleware.auth import get_current_user
 from app.middleware.session import validate_session
@@ -22,10 +22,6 @@ SET_SIZE = 50   # questions per shared set / per session
 # ── Subscription gate ─────────────────────────────────────────────────────────
 
 def _ensure_trial_or_raise(user_id: str, exam_slug: str) -> None:
-    """
-    Auto-create a 7-day trial subscription for the user's first (and only) exam.
-    Raises 403 if trial already used for a different exam or no paid sub exists.
-    """
     user = fetchone("SELECT trial_used FROM users WHERE id = %s", (user_id,))
     if user and not user["trial_used"]:
         trial_expires = datetime.now(timezone.utc) + timedelta(days=7)
@@ -36,7 +32,6 @@ def _ensure_trial_or_raise(user_id: str, exam_slug: str) -> None:
         )
         execute("UPDATE users SET trial_used = TRUE WHERE id = %s", (user_id,))
     else:
-        # Check if they have an active sub for a DIFFERENT exam to give a clearer message
         other = fetchone(
             "SELECT exam_slug FROM user_subscriptions "
             "WHERE user_id = %s AND exam_slug != %s AND status IN ('active', 'trial') "
@@ -55,7 +50,6 @@ def _ensure_trial_or_raise(user_id: str, exam_slug: str) -> None:
 
 
 def _check_subscription(user_id: str, exam_slug: str) -> None:
-    """Verify active sub exists; auto-create trial for first-timers."""
     if settings.bypass_subscription:
         return
     sub = fetchone(
@@ -103,15 +97,6 @@ def _select_domain(exam_slug: str, domain_scores: dict) -> str:
 # ── Practice session management ───────────────────────────────────────────────
 
 def _find_set_for_new_session(exam_slug: str, questions_seen: list) -> int:
-    """
-    Determine which set_number a new practice session should be assigned to.
-
-    Priority:
-    1. The lowest set that is still being built (< SET_SIZE questions) — user
-       draws existing questions and their answers generate new ones into this set.
-    2. The lowest full set where the user still has unseen questions.
-    3. A brand-new set (max + 1) if the user has exhausted everything.
-    """
     rows = fetchall(
         "SELECT set_number, COUNT(*) AS cnt FROM questions "
         "WHERE exam_slug = %s AND is_active = TRUE "
@@ -119,14 +104,13 @@ def _find_set_for_new_session(exam_slug: str, questions_seen: list) -> int:
         (exam_slug,),
     )
     if not rows:
-        return 1  # first ever question will be generated into set 1
+        return 1
 
     seen_set = set(questions_seen)
     for row in rows:
         sn, cnt = row["set_number"], row["cnt"]
         if cnt < SET_SIZE:
-            return sn  # still building — join this set
-        # Full set: check if user has unseen questions here
+            return sn
         ids = fetchall(
             "SELECT id FROM questions WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE",
             (exam_slug, sn),
@@ -134,14 +118,10 @@ def _find_set_for_new_session(exam_slug: str, questions_seen: list) -> int:
         if any(r["id"] not in seen_set for r in ids):
             return sn
 
-    return rows[-1]["set_number"] + 1  # start a new set
+    return rows[-1]["set_number"] + 1
 
 
 def _get_or_create_practice_session(user_id: str, exam_slug: str, questions_seen: list) -> dict:
-    """
-    Return the user's current incomplete practice session, creating one if needed.
-    One session = one set of up to SET_SIZE questions.
-    """
     session = fetchone(
         "SELECT id, set_number, questions_answered, is_complete FROM practice_sessions "
         "WHERE user_id = %s AND exam_slug = %s AND is_complete = FALSE "
@@ -168,29 +148,42 @@ def _mark_session_complete(session_id: str) -> None:
     )
 
 
-def _increment_session(session_id: str) -> int:
-    """Increment questions_answered; return new count."""
+def _increment_session(session_id: str, time_spent: int = 0) -> int:
     row = execute(
         "UPDATE practice_sessions "
-        "SET questions_answered = questions_answered + 1, last_active_at = NOW() "
+        "SET questions_answered = questions_answered + 1, "
+        "    time_spent_seconds = time_spent_seconds + %s, "
+        "    last_active_at = NOW() "
         "WHERE id = %s "
         "RETURNING questions_answered",
-        (session_id,),
+        (time_spent, session_id),
     )
     return row["questions_answered"] if row else 0
+
+
+# ── Streak logic ──────────────────────────────────────────────────────────────
+
+def _compute_streak(current_streak: int, last_streak_date) -> int:
+    today = datetime.now(timezone.utc).date()
+    if last_streak_date is None:
+        return 1
+    if isinstance(last_streak_date, str):
+        last_streak_date = date.fromisoformat(last_streak_date)
+    if last_streak_date == today:
+        return current_streak  # already answered today
+    if (today - last_streak_date).days == 1:
+        return current_streak + 1  # consecutive day
+    return 1  # gap — reset
 
 
 # ── Question pool fetch (DB + Redis) ──────────────────────────────────────────
 
 def _fetch_question_pool(exam_slug: str, domain: str, questions_seen: list, set_number: int) -> list[dict]:
-    """
-    Return unseen candidate questions for the given domain + set.
-    Shared Redis cache per exam+domain+set; per-user filtering applied after retrieval.
-    """
     pool = get_cached_pool(exam_slug, f"{domain}:set{set_number}")
     if pool is None:
         pool = fetchall(
-            "SELECT id, exam_slug, domain, topic, stem, options, difficulty FROM questions "
+            "SELECT id, exam_slug, domain, topic, stem, options, difficulty, option_explanations "
+            "FROM questions "
             "WHERE exam_slug = %s AND domain = %s AND set_number = %s AND is_active = TRUE LIMIT 20",
             (exam_slug, domain, set_number),
         )
@@ -204,10 +197,6 @@ def _fetch_question_pool(exam_slug: str, domain: str, questions_seen: list, set_
 # ── Background prefetch ───────────────────────────────────────────────────────
 
 def _prefetch_question_for_user(user_id: str, exam_slug: str) -> None:
-    """
-    Best-effort: pick the likely-next question and cache it in Redis.
-    Uses the user's current practice session to respect set boundaries.
-    """
     try:
         progress = fetchone(
             "SELECT domain_scores, questions_seen FROM user_progress "
@@ -249,7 +238,6 @@ async def get_question(
     await validate_session(request, user_id)
     _check_subscription(user_id, body.exam_slug)
 
-    # Load user progress
     progress = fetchone(
         "SELECT domain_scores, questions_seen FROM user_progress "
         "WHERE user_id = %s AND exam_slug = %s",
@@ -258,18 +246,18 @@ async def get_question(
     domain_scores = progress["domain_scores"] if progress else {}
     questions_seen = progress["questions_seen"] if progress else []
 
-    # Get or create practice session (determines which set we're in)
     session = _get_or_create_practice_session(user_id, body.exam_slug, questions_seen)
     set_number = session["set_number"]
     questions_answered = session["questions_answered"]
 
-    # Session already hit SET_SIZE — tell the frontend
     if questions_answered >= SET_SIZE:
         _mark_session_complete(session["id"])
         raise HTTPException(status_code=200, detail="SESSION_COMPLETE")
 
     def _with_meta(q: dict) -> dict:
         q["options"] = _normalize_options(q.get("options") or [])
+        if not q.get("option_explanations"):
+            q["option_explanations"] = {}
         q["session_progress"] = {
             "answered": questions_answered,
             "total": SET_SIZE,
@@ -277,25 +265,23 @@ async def get_question(
         }
         return q
 
-    # 1. Redis prefetch — only valid if it belongs to the current set
+    # 1. Redis prefetch
     prefetched = pop_prefetch(user_id, body.exam_slug)
     if prefetched and prefetched.get("set_number") == set_number:
         return _with_meta(prefetched)
-    elif prefetched:
-        # Stale prefetch from a different set — discard silently
-        pass
 
     # 2. Pool cache → DB
     domain = _select_domain(body.exam_slug, domain_scores)
     pool = _fetch_question_pool(body.exam_slug, domain, questions_seen, set_number)
 
-    # If no unseen questions in chosen domain, try any domain in this set
     if not pool:
         all_unseen = fetchall(
-            "SELECT id, exam_slug, domain, topic, stem, options, difficulty FROM questions "
+            "SELECT id, exam_slug, domain, topic, stem, options, difficulty, option_explanations "
+            "FROM questions "
             "WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE "
             "AND id != ALL(%s) LIMIT 20" if questions_seen else
-            "SELECT id, exam_slug, domain, topic, stem, options, difficulty FROM questions "
+            "SELECT id, exam_slug, domain, topic, stem, options, difficulty, option_explanations "
+            "FROM questions "
             "WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE LIMIT 20",
             (body.exam_slug, set_number, questions_seen) if questions_seen else (body.exam_slug, set_number),
         )
@@ -305,27 +291,27 @@ async def get_question(
         q = random.choice(pool)
         return _with_meta(dict(q))
 
-    # 3. Set not full yet → generate from AI and add to current set
+    # 3. Generate from AI
     set_count = fetchone(
         "SELECT COUNT(*) AS cnt FROM questions WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE",
         (body.exam_slug, set_number),
     )
     if set_count and set_count["cnt"] >= SET_SIZE:
-        # Set is full and user has seen everything — session should be done
         _mark_session_complete(session["id"])
         raise HTTPException(status_code=200, detail="SESSION_COMPLETE")
 
     generated = ai_generate_question(body.exam_slug, domain)
     q = execute(
         "INSERT INTO questions "
-        "(id, exam_slug, domain, stem, options, correct_answer, explanation, difficulty, set_number) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-        "RETURNING id, exam_slug, domain, stem, options, difficulty, set_number",
+        "(id, exam_slug, domain, stem, options, correct_answer, explanation, option_explanations, difficulty, set_number) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "RETURNING id, exam_slug, domain, stem, options, difficulty, option_explanations, set_number",
         (
             str(uuid.uuid4()), body.exam_slug, domain,
             generated["stem"], json.dumps(generated["options"]),
-            generated["correct_answer"], generated["explanation"], "medium",
-            set_number,
+            generated["correct_answer"], generated["explanation"],
+            json.dumps(generated.get("option_explanations", {})),
+            "medium", set_number,
         ),
     )
     return _with_meta(dict(q))
@@ -341,7 +327,7 @@ async def submit_answer(
     await validate_session(request, user_id)
 
     q = fetchone(
-        "SELECT correct_answer, explanation, domain FROM questions WHERE id = %s",
+        "SELECT correct_answer, explanation, domain, option_explanations FROM questions WHERE id = %s",
         (body.question_id,),
     )
     if not q:
@@ -349,10 +335,15 @@ async def submit_answer(
 
     correct = body.answer == q["correct_answer"]
     domain = q["domain"]
+    option_explanations = q.get("option_explanations") or {}
+    time_spent = body.time_spent_seconds or 0
+
+    today = datetime.now(timezone.utc).date()
 
     # Update user progress
     progress = fetchone(
-        "SELECT id, domain_scores, questions_seen, total_answered, total_correct "
+        "SELECT id, domain_scores, questions_seen, total_answered, total_correct, "
+        "streak_days, last_streak_date, time_committed_seconds "
         "FROM user_progress WHERE user_id = %s AND exam_slug = %s",
         (user_id, body.exam_slug),
     )
@@ -365,26 +356,51 @@ async def submit_answer(
             domain_scores[domain]["correct"] += 1
         if body.question_id not in questions_seen:
             questions_seen.append(body.question_id)
+
+        new_streak = _compute_streak(
+            progress.get("streak_days", 0),
+            progress.get("last_streak_date"),
+        )
+
         execute(
-            "UPDATE user_progress SET domain_scores = %s, questions_seen = %s, "
-            "total_answered = total_answered + 1, total_correct = total_correct + %s "
+            "UPDATE user_progress SET "
+            "domain_scores = %s, questions_seen = %s, "
+            "total_answered = total_answered + 1, total_correct = total_correct + %s, "
+            "streak_days = %s, last_streak_date = %s, "
+            "time_committed_seconds = time_committed_seconds + %s "
             "WHERE id = %s",
-            (json.dumps(domain_scores), questions_seen, 1 if correct else 0, progress["id"]),
+            (
+                json.dumps(domain_scores), questions_seen,
+                1 if correct else 0,
+                new_streak, today,
+                time_spent,
+                progress["id"],
+            ),
         )
     else:
         domain_scores = {domain: {"correct": 1 if correct else 0, "total": 1}}
+        new_streak = 1
         execute(
             "INSERT INTO user_progress "
-            "(id, user_id, exam_slug, domain_scores, questions_seen, total_answered, total_correct) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            "(id, user_id, exam_slug, domain_scores, questions_seen, total_answered, total_correct, "
+            "streak_days, last_streak_date, time_committed_seconds) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 str(uuid.uuid4()), user_id, body.exam_slug,
                 json.dumps(domain_scores), [body.question_id],
                 1, 1 if correct else 0,
+                1, today, time_spent,
             ),
         )
 
-    # Advance practice session counter; mark complete if we just hit SET_SIZE
+    # Record attempt
+    execute(
+        "INSERT INTO user_question_attempts (id, user_id, exam_slug, question_id, user_answer, is_correct) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (str(uuid.uuid4()), user_id, body.exam_slug, body.question_id, body.answer, correct),
+    )
+
+    # Advance practice session
     session = fetchone(
         "SELECT id, questions_answered FROM practice_sessions "
         "WHERE user_id = %s AND exam_slug = %s AND is_complete = FALSE "
@@ -393,12 +409,11 @@ async def submit_answer(
     )
     session_complete = False
     if session:
-        new_count = _increment_session(session["id"])
+        new_count = _increment_session(session["id"], time_spent)
         if new_count >= SET_SIZE:
             _mark_session_complete(session["id"])
             session_complete = True
 
-    # Prefetch next question in background (only if session not done)
     if not session_complete:
         background_tasks.add_task(_prefetch_question_for_user, user_id, body.exam_slug)
 
@@ -406,6 +421,8 @@ async def submit_answer(
         "correct": correct,
         "correct_answer": q["correct_answer"],
         "explanation": q["explanation"],
+        "option_explanations": option_explanations,
         "domain_scores": domain_scores,
+        "streak_days": new_streak,
         "session_complete": session_complete,
     }
