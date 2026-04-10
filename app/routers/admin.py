@@ -260,6 +260,96 @@ async def get_stats(admin_id: str = Depends(require_admin)):
     }
 
 
+# ── Questions browser ────────────────────────────────────────────────────────
+
+@router.get("/questions")
+async def list_questions(
+    exam_slug: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    admin_id: str = Depends(require_admin),
+):
+    offset = (page - 1) * page_size
+    if exam_slug:
+        rows = fetchall(
+            "SELECT id, exam_slug, domain, topic, stem, options, correct_answer, "
+            "explanation, option_explanations, difficulty, set_number, is_active "
+            "FROM questions WHERE exam_slug = %s AND is_active = TRUE "
+            "ORDER BY set_number, domain, created_at DESC LIMIT %s OFFSET %s",
+            (exam_slug, page_size, offset),
+        )
+        total_row = fetchone(
+            "SELECT COUNT(*) AS cnt FROM questions WHERE exam_slug = %s AND is_active = TRUE",
+            (exam_slug,),
+        )
+    else:
+        rows = fetchall(
+            "SELECT id, exam_slug, domain, topic, stem, options, correct_answer, "
+            "explanation, option_explanations, difficulty, set_number, is_active "
+            "FROM questions WHERE is_active = TRUE "
+            "ORDER BY exam_slug, set_number, domain, created_at DESC LIMIT %s OFFSET %s",
+            (page_size, offset),
+        )
+        total_row = fetchone(
+            "SELECT COUNT(*) AS cnt FROM questions WHERE is_active = TRUE", ()
+        )
+
+    total = total_row["cnt"] if total_row else 0
+
+    def _parse(row):
+        opts = row["options"]
+        if isinstance(opts, str):
+            opts = json.loads(opts)
+        expl = row["option_explanations"] or {}
+        if isinstance(expl, str):
+            expl = json.loads(expl)
+        return {
+            "id": str(row["id"]),
+            "exam_slug": row["exam_slug"],
+            "domain": row["domain"],
+            "topic": row["topic"],
+            "stem": row["stem"],
+            "options": opts,
+            "correct_answer": row["correct_answer"],
+            "explanation": row["explanation"],
+            "option_explanations": expl,
+            "difficulty": row["difficulty"],
+            "set_number": row["set_number"],
+        }
+
+    return {
+        "questions": [_parse(r) for r in (rows or [])],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.patch("/questions/{question_id}")
+async def update_question(
+    question_id: str,
+    body: dict,
+    admin_id: str = Depends(require_admin),
+):
+    allowed = {"stem", "correct_answer", "explanation", "difficulty", "domain", "topic", "option_explanations"}
+    fields = {k: v for k, v in body.items() if k in allowed}
+    if not fields:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    # Serialize JSON fields
+    for json_field in ("option_explanations",):
+        if json_field in fields and not isinstance(fields[json_field], str):
+            fields[json_field] = json.dumps(fields[json_field])
+
+    set_clause = ", ".join(f"{k} = %s" for k in fields)
+    values = list(fields.values()) + [question_id]
+    execute(
+        f"UPDATE questions SET {set_clause} WHERE id = %s",
+        values,
+    )
+    return {"ok": True}
+
+
 # ── Platform Settings ────────────────────────────────────────────────────────
 
 @router.get("/settings")
