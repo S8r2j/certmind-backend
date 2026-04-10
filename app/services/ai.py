@@ -195,6 +195,59 @@ def _normalize_options(options: list) -> list:
     return normalized
 
 
+def enrich_question(stem: str, correct_answer: str, exam_slug: str, domain: str = "") -> dict:
+    """
+    Given a stem and the correct answer letter (A/B/C/D), generates:
+    - option texts for all 4 keys (correct + 3 distractors)
+    - explanation
+    - option_explanations
+
+    Synchronous — call via asyncio.to_thread when used inside async SSE generators.
+    Returns same shape as generate_question: {options, explanation, option_explanations}
+    """
+    meta = EXAM_METADATA.get(exam_slug, {})
+    exam_title = meta.get("title", exam_slug)
+    domain_hint = f" This question is from the domain: {domain}." if domain else ""
+    other_keys = [k for k in ["A", "B", "C", "D"] if k != correct_answer]
+
+    prompt = (
+        f"You are an expert exam question writer for {exam_title}.{domain_hint}\n\n"
+        f"The following MCQ stem has a known correct answer that maps to option {correct_answer}:\n\n"
+        f'STEM: "{stem}"\n\n'
+        f"Your tasks:\n"
+        f"1. Write the option TEXT for the correct answer ({correct_answer}) — it must directly and correctly answer the stem.\n"
+        f"2. Write 3 plausible but INCORRECT distractor options for keys {', '.join(other_keys)}. "
+        f"Distractors must be believable and related to the topic, but clearly wrong.\n"
+        f"3. Write a 2-3 sentence explanation for why option {correct_answer} is correct.\n"
+        f"4. Write a 1-2 sentence per-option explanation for all 4 options.\n\n"
+        f"Respond ONLY with valid JSON, no markdown, no text outside the JSON.\n"
+        f'Format: {{"options": [{{"key": "A", "text": "..."}}, {{"key": "B", "text": "..."}}, '
+        f'{{"key": "C", "text": "..."}}, {{"key": "D", "text": "..."}}], '
+        f'"explanation": "...", '
+        f'"option_explanations": {{"A": "Correct — because ..." or "Incorrect — because ...", '
+        f'"B": "...", "C": "...", "D": "..."}}}}'
+    )
+
+    provider = _provider()
+    if provider == "anthropic":
+        result = _anthropic_generate(prompt)
+    elif provider == "google":
+        result = _google_generate(prompt)
+    else:
+        result = _groq_generate(prompt)
+
+    result["options"] = _normalize_options(result.get("options", []))
+    if "option_explanations" not in result or not isinstance(result["option_explanations"], dict):
+        result["option_explanations"] = {}
+
+    # Guard: the correct_answer key must be present in returned options
+    keys_present = {o["key"] for o in result.get("options", [])}
+    if correct_answer not in keys_present:
+        raise ValueError(f"AI did not return option for correct_answer key '{correct_answer}'")
+
+    return result
+
+
 def generate_question(exam_slug: str, domain: str) -> dict:
     """Synchronous call — returns parsed JSON dict with normalized options and option_explanations."""
     meta = EXAM_METADATA[exam_slug]
