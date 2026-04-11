@@ -273,7 +273,7 @@ async def list_questions(
     if exam_slug:
         rows = fetchall(
             "SELECT id, exam_slug, domain, topic, stem, options, correct_answer, "
-            "explanation, option_explanations, difficulty, set_number, is_active "
+            "explanation, option_explanations, difficulty, set_number, is_active, question_type "
             "FROM questions WHERE exam_slug = %s AND is_active = TRUE "
             "ORDER BY set_number, domain, created_at DESC LIMIT %s OFFSET %s",
             (exam_slug, page_size, offset),
@@ -285,7 +285,7 @@ async def list_questions(
     else:
         rows = fetchall(
             "SELECT id, exam_slug, domain, topic, stem, options, correct_answer, "
-            "explanation, option_explanations, difficulty, set_number, is_active "
+            "explanation, option_explanations, difficulty, set_number, is_active, question_type "
             "FROM questions WHERE is_active = TRUE "
             "ORDER BY exam_slug, set_number, domain, created_at DESC LIMIT %s OFFSET %s",
             (page_size, offset),
@@ -315,6 +315,7 @@ async def list_questions(
             "option_explanations": expl,
             "difficulty": row["difficulty"],
             "set_number": row["set_number"],
+            "question_type": row.get("question_type") or "single",
         }
 
     return {
@@ -331,7 +332,7 @@ async def update_question(
     body: dict,
     admin_id: str = Depends(require_admin),
 ):
-    allowed = {"stem", "correct_answer", "explanation", "difficulty", "domain", "topic", "option_explanations"}
+    allowed = {"stem", "correct_answer", "explanation", "difficulty", "domain", "topic", "option_explanations", "question_type"}
     fields = {k: v for k, v in body.items() if k in allowed}
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
@@ -377,6 +378,7 @@ async def update_setting(
 _REQUIRED_COLS = {"stem", "correct_answer"}
 _FULL_COLS = {"stem", "option_a", "option_b", "option_c", "option_d", "correct_answer"}
 _VALID_ANSWERS = {"A", "B", "C", "D"}
+_VALID_QTYPES = {"single", "multi", "fill"}
 
 _FULL_TEMPLATE_ROW = {
     "stem": "Which AWS service provides managed relational database hosting?",
@@ -385,6 +387,7 @@ _FULL_TEMPLATE_ROW = {
     "option_c": "Amazon Redshift",
     "option_d": "Amazon ElastiCache",
     "correct_answer": "B",
+    "question_type": "single",
     "explanation": "Amazon RDS manages relational databases like MySQL, PostgreSQL, etc.",
     "option_explanation_a": "Incorrect — DynamoDB is a NoSQL key-value store.",
     "option_explanation_b": "Correct — RDS provides managed relational database engines.",
@@ -393,9 +396,42 @@ _FULL_TEMPLATE_ROW = {
     "domain": "Cloud Technology and Services",
     "difficulty": "easy",
 }
+_MULTI_TEMPLATE_ROW = {
+    "stem": "Which TWO services can be used to host static websites on AWS? (Select TWO)",
+    "option_a": "Amazon S3",
+    "option_b": "Amazon RDS",
+    "option_c": "Amazon CloudFront",
+    "option_d": "AWS Lambda",
+    "correct_answer": "A,C",
+    "question_type": "multi",
+    "explanation": "S3 can host static websites directly and CloudFront can serve S3 content globally.",
+    "option_explanation_a": "Correct — S3 supports static website hosting.",
+    "option_explanation_b": "Incorrect — RDS is a relational database service.",
+    "option_explanation_c": "Correct — CloudFront can front an S3 static site as a CDN.",
+    "option_explanation_d": "Incorrect — Lambda runs code, it is not a static hosting service.",
+    "domain": "Cloud Technology and Services",
+    "difficulty": "medium",
+}
+_FILL_TEMPLATE_ROW = {
+    "stem": "AWS [BLANK] is used to manage encryption keys for data at rest and in transit.",
+    "option_a": "KMS",
+    "option_b": "IAM",
+    "option_c": "Shield",
+    "option_d": "GuardDuty",
+    "correct_answer": "A",
+    "question_type": "fill",
+    "explanation": "AWS KMS (Key Management Service) manages cryptographic keys for encryption.",
+    "option_explanation_a": "Correct — KMS manages encryption keys.",
+    "option_explanation_b": "Incorrect — IAM manages identities and access, not keys.",
+    "option_explanation_c": "Incorrect — Shield is a DDoS protection service.",
+    "option_explanation_d": "Incorrect — GuardDuty is a threat detection service.",
+    "domain": "Security and Compliance",
+    "difficulty": "medium",
+}
 _MINIMAL_TEMPLATE_ROW = {
     "stem": "What does S3 stand for in AWS?",
     "correct_answer": "A",
+    "question_type": "single",
     "domain": "Cloud Technology and Services",
 }
 
@@ -417,13 +453,36 @@ def _validate_csv(content: bytes) -> tuple[list[dict], str | None]:
 
     rows = []
     for i, row in enumerate(reader, start=2):  # row 1 is header
-        stem = (row.get("stem") or "").strip()
-        answer = (row.get("correct_answer") or "").strip().upper()
+        norm = {k.strip().lower(): (v or "").strip() for k, v in row.items()}
+        stem = norm.get("stem", "")
+        # correct_answers is an alias for correct_answer (multi-select convenience)
+        answer_raw = norm.get("correct_answer") or norm.get("correct_answers", "")
+        answer_raw = answer_raw.upper()
+        qtype = norm.get("question_type", "single").lower() or "single"
+
         if not stem:
             return [], f"Row {i}: 'stem' is empty."
-        if answer not in _VALID_ANSWERS:
-            return [], f"Row {i}: 'correct_answer' must be A, B, C or D — got '{answer}'."
-        rows.append({k.strip().lower(): (v or "").strip() for k, v in row.items()})
+        if qtype not in _VALID_QTYPES:
+            return [], f"Row {i}: 'question_type' must be single, multi, or fill — got '{qtype}'."
+
+        if qtype == "multi":
+            parts = [p.strip() for p in answer_raw.split(",") if p.strip()]
+            if len(parts) < 2:
+                return [], f"Row {i}: multi-select 'correct_answer' must have at least 2 comma-separated keys, e.g. 'A,C'."
+            for p in parts:
+                if p not in _VALID_ANSWERS:
+                    return [], f"Row {i}: invalid key '{p}' in 'correct_answer' — must be A, B, C, or D."
+            answer_raw = ",".join(sorted(parts))
+        else:
+            if answer_raw not in _VALID_ANSWERS:
+                return [], f"Row {i}: 'correct_answer' must be A, B, C or D — got '{answer_raw}'."
+
+        if qtype == "fill" and "[BLANK]" not in stem:
+            return [], f"Row {i}: fill-in-the-blank stem must contain '[BLANK]'."
+
+        norm["correct_answer"] = answer_raw
+        norm["question_type"] = qtype
+        rows.append(norm)
 
     if not rows:
         return [], "CSV has a header but no data rows."
@@ -463,6 +522,7 @@ async def _stream_import(exam_slug: str, rows: list[dict]):
         correct_answer = row["correct_answer"].upper()
         domain = row.get("domain", "")
         difficulty = row.get("difficulty", "medium") or "medium"
+        question_type = row.get("question_type", "single") or "single"
 
         # Duplicate check
         dup = await asyncio.to_thread(
@@ -507,16 +567,18 @@ async def _stream_import(exam_slug: str, rows: list[dict]):
                 continue
 
         try:
+            # multi/fill float questions use set_number=0 (exam-wide pool)
+            insert_set = 0 if question_type in ("multi", "fill") else set_number
             await asyncio.to_thread(
                 execute,
                 "INSERT INTO questions (id, exam_slug, domain, stem, options, correct_answer, "
-                "explanation, option_explanations, difficulty, set_number) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "explanation, option_explanations, difficulty, set_number, question_type) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     str(uuid.uuid4()), exam_slug, domain, stem,
                     json.dumps(options), correct_answer,
                     explanation, json.dumps(option_explanations),
-                    difficulty, set_number,
+                    difficulty, insert_set, question_type,
                 ),
             )
             inserted += 1
@@ -551,17 +613,18 @@ async def import_template(
 ):
     full_headers = [
         "stem", "option_a", "option_b", "option_c", "option_d",
-        "correct_answer", "explanation",
+        "correct_answer", "question_type", "explanation",
         "option_explanation_a", "option_explanation_b",
         "option_explanation_c", "option_explanation_d",
         "domain", "difficulty",
     ]
-    minimal_headers = ["stem", "correct_answer", "domain"]
 
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=full_headers, extrasaction="ignore")
     writer.writeheader()
     writer.writerow(_FULL_TEMPLATE_ROW)
+    writer.writerow(_MULTI_TEMPLATE_ROW)
+    writer.writerow(_FILL_TEMPLATE_ROW)
 
     # Minimal row — fill missing full columns with empty string
     minimal_row = {h: "" for h in full_headers}

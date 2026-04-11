@@ -80,7 +80,7 @@ class QuestionRequest(BaseModel):
 class AnswerRequest(BaseModel):
     exam_slug: str
     question_id: str
-    answer: str = Field(..., min_length=1, max_length=1)
+    answer: str = Field(..., min_length=1, max_length=20)  # "A" or "A,C" for multi-select
     time_spent_seconds: Optional[int] = None
 
 

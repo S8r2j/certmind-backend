@@ -6,7 +6,12 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from app.middleware.auth import get_current_user
 from app.middleware.session import validate_session
 from app.services.database import fetchone, fetchall, execute
-from app.services.ai import generate_question as ai_generate_question, EXAM_METADATA, _normalize_options
+from app.services.ai import (
+    generate_question as ai_generate_question,
+    generate_multi_question as ai_generate_multi,
+    generate_fill_question as ai_generate_fill,
+    EXAM_METADATA, _normalize_options,
+)
 from app.services.redis_client import (
     cache_question_pool, get_cached_pool,
     set_prefetch, pop_prefetch,
@@ -167,7 +172,8 @@ def _find_set_for_new_session(exam_slug: str, questions_seen: list) -> int:
 
 def _get_or_create_practice_session(user_id: str, exam_slug: str, questions_seen: list) -> dict:
     session = fetchone(
-        "SELECT id, set_number, questions_answered, is_complete FROM practice_sessions "
+        "SELECT id, set_number, questions_answered, is_complete, multi_served, fill_served "
+        "FROM practice_sessions "
         "WHERE user_id = %s AND exam_slug = %s AND is_complete = FALSE "
         "ORDER BY created_at DESC LIMIT 1",
         (user_id, exam_slug),
@@ -182,7 +188,11 @@ def _get_or_create_practice_session(user_id: str, exam_slug: str, questions_seen
         "VALUES (%s, %s, %s, %s)",
         (session_id, user_id, exam_slug, set_number),
     )
-    return {"id": session_id, "set_number": set_number, "questions_answered": 0, "is_complete": False}
+    return {
+        "id": session_id, "set_number": set_number,
+        "questions_answered": 0, "is_complete": False,
+        "multi_served": 0, "fill_served": 0,
+    }
 
 
 def _mark_session_complete(session_id: str) -> None:
@@ -203,6 +213,14 @@ def _increment_session(session_id: str, time_spent: int = 0) -> int:
         (time_spent, session_id),
     )
     return row["questions_answered"] if row else 0
+
+
+# ── Answer scoring ────────────────────────────────────────────────────────────
+
+def _check_answer(submitted: str, correct: str, qtype: str) -> bool:
+    if qtype == "multi":
+        return set(submitted.upper().split(",")) == set(correct.upper().split(","))
+    return submitted.strip().upper() == correct.strip().upper()
 
 
 # ── Streak logic ──────────────────────────────────────────────────────────────
@@ -226,9 +244,9 @@ def _fetch_question_pool(exam_slug: str, domain: str, questions_seen: list, set_
     pool = get_cached_pool(exam_slug, f"{domain}:set{set_number}")
     if pool is None:
         pool = fetchall(
-            "SELECT id, exam_slug, domain, topic, stem, options, difficulty, option_explanations "
+            "SELECT id, exam_slug, domain, topic, stem, options, difficulty, option_explanations, question_type "
             "FROM questions "
-            "WHERE exam_slug = %s AND domain = %s AND set_number = %s AND is_active = TRUE LIMIT 20",
+            "WHERE exam_slug = %s AND domain = %s AND set_number = %s AND question_type = 'single' AND is_active = TRUE LIMIT 20",
             (exam_slug, domain, set_number),
         )
         if pool:
@@ -316,6 +334,11 @@ async def get_question(
     session = _get_or_create_practice_session(user_id, body.exam_slug, questions_seen)
     set_number = session["set_number"]
     questions_answered = session["questions_answered"]
+    multi_served = session.get("multi_served", 0)
+    fill_served = session.get("fill_served", 0)
+
+    MULTI_QUOTA = 5
+    FILL_QUOTA = 2
 
     # Tab-level lock: reject if another tab claimed this session in the last 30s
     if body.tab_id:
@@ -349,6 +372,14 @@ async def get_question(
         q["options"] = _normalize_options(q.get("options") or [])
         if not q.get("option_explanations"):
             q["option_explanations"] = {}
+        q.setdefault("question_type", "single")
+        # For multi-select: expose how many answers the user must select
+        if q["question_type"] == "multi":
+            # Fetch correct_answer count from DB (we don't want to expose the actual answer)
+            ca_row = fetchone("SELECT correct_answer FROM questions WHERE id = %s", (q["id"],))
+            if ca_row:
+                parts = [p for p in ca_row["correct_answer"].split(",") if p.strip()]
+                q["correct_answers_count"] = len(parts)
         q["session_progress"] = {
             "answered": questions_answered,
             "total": _set_size(),
@@ -356,24 +387,65 @@ async def get_question(
         }
         return q
 
-    # 1. Redis prefetch
-    prefetched = pop_prefetch(user_id, body.exam_slug)
-    if prefetched and prefetched.get("set_number") == set_number:
-        return _with_meta(prefetched)
+    # 1. Redis prefetch (single-type only — skip if we need multi/fill next)
+    needs_multi = multi_served < MULTI_QUOTA and questions_answered < _set_size() - FILL_QUOTA
+    needs_fill = fill_served < FILL_QUOTA
 
-    # 2. Pool cache → DB
+    if not needs_multi and not needs_fill:
+        prefetched = pop_prefetch(user_id, body.exam_slug)
+        if prefetched and prefetched.get("set_number") == set_number:
+            return _with_meta(prefetched)
+
     domain = _select_domain(body.exam_slug, domain_scores)
+
+    # 2. Float pool for multi/fill — queried exam-wide, no set_number restriction
+    if needs_multi or needs_fill:
+        qtype = "multi" if needs_multi else "fill"
+        counter_col = "multi_served" if needs_multi else "fill_served"
+        float_pool = fetchall(
+            "SELECT id, exam_slug, domain, topic, stem, options, difficulty, option_explanations, question_type "
+            "FROM questions "
+            "WHERE exam_slug = %s AND question_type = %s AND is_active = TRUE "
+            + ("AND id != ALL(%s) LIMIT 10" if questions_seen else "LIMIT 10"),
+            (body.exam_slug, qtype, questions_seen) if questions_seen else (body.exam_slug, qtype),
+        )
+        if float_pool:
+            execute(
+                f"UPDATE practice_sessions SET {counter_col} = {counter_col} + 1 WHERE id = %s",
+                (session["id"],),
+            )
+            return _with_meta(dict(random.choice(float_pool)))
+        else:
+            # Generate one with AI
+            generated = ai_generate_multi(body.exam_slug, domain) if qtype == "multi" else ai_generate_fill(body.exam_slug, domain)
+            q_row = execute(
+                "INSERT INTO questions "
+                "(id, exam_slug, domain, stem, options, correct_answer, explanation, option_explanations, difficulty, set_number, question_type) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id, exam_slug, domain, stem, options, difficulty, option_explanations, set_number, question_type",
+                (
+                    str(uuid.uuid4()), body.exam_slug, domain,
+                    generated["stem"], json.dumps(generated["options"]),
+                    generated["correct_answer"], generated["explanation"],
+                    json.dumps(generated.get("option_explanations", {})),
+                    "medium", 0, qtype,
+                ),
+            )
+            execute(
+                f"UPDATE practice_sessions SET {counter_col} = {counter_col} + 1 WHERE id = %s",
+                (session["id"],),
+            )
+            return _with_meta(dict(q_row))
+
+    # 3. Pool cache → DB (single-type questions)
     pool = _fetch_question_pool(body.exam_slug, domain, questions_seen, set_number)
 
     if not pool:
         all_unseen = fetchall(
-            "SELECT id, exam_slug, domain, topic, stem, options, difficulty, option_explanations "
+            "SELECT id, exam_slug, domain, topic, stem, options, difficulty, option_explanations, question_type "
             "FROM questions "
-            "WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE "
-            "AND id != ALL(%s) LIMIT 20" if questions_seen else
-            "SELECT id, exam_slug, domain, topic, stem, options, difficulty, option_explanations "
-            "FROM questions "
-            "WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE LIMIT 20",
+            "WHERE exam_slug = %s AND set_number = %s AND question_type = 'single' AND is_active = TRUE "
+            + ("AND id != ALL(%s) LIMIT 20" if questions_seen else "LIMIT 20"),
             (body.exam_slug, set_number, questions_seen) if questions_seen else (body.exam_slug, set_number),
         )
         pool = all_unseen or []
@@ -382,7 +454,7 @@ async def get_question(
         q = random.choice(pool)
         return _with_meta(dict(q))
 
-    # 3. Generate from AI
+    # 4. Generate from AI (single)
     set_count = fetchone(
         "SELECT COUNT(*) AS cnt FROM questions WHERE exam_slug = %s AND set_number = %s AND is_active = TRUE",
         (body.exam_slug, set_number),
@@ -394,15 +466,15 @@ async def get_question(
     generated = ai_generate_question(body.exam_slug, domain)
     q = execute(
         "INSERT INTO questions "
-        "(id, exam_slug, domain, stem, options, correct_answer, explanation, option_explanations, difficulty, set_number) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-        "RETURNING id, exam_slug, domain, stem, options, difficulty, option_explanations, set_number",
+        "(id, exam_slug, domain, stem, options, correct_answer, explanation, option_explanations, difficulty, set_number, question_type) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "RETURNING id, exam_slug, domain, stem, options, difficulty, option_explanations, set_number, question_type",
         (
             str(uuid.uuid4()), body.exam_slug, domain,
             generated["stem"], json.dumps(generated["options"]),
             generated["correct_answer"], generated["explanation"],
             json.dumps(generated.get("option_explanations", {})),
-            "medium", set_number,
+            "medium", set_number, "single",
         ),
     )
     return _with_meta(dict(q))
@@ -418,13 +490,14 @@ async def submit_answer(
     await validate_session(request, user_id)
 
     q = fetchone(
-        "SELECT correct_answer, explanation, domain, option_explanations FROM questions WHERE id = %s",
+        "SELECT correct_answer, explanation, domain, option_explanations, question_type FROM questions WHERE id = %s",
         (body.question_id,),
     )
     if not q:
         raise HTTPException(status_code=404, detail="Question not found")
 
-    correct = body.answer == q["correct_answer"]
+    qtype = q.get("question_type") or "single"
+    correct = _check_answer(body.answer, q["correct_answer"], qtype)
     domain = q["domain"]
     option_explanations = q.get("option_explanations") or {}
     time_spent = body.time_spent_seconds or 0
@@ -516,4 +589,5 @@ async def submit_answer(
         "domain_scores": domain_scores,
         "streak_days": new_streak,
         "session_complete": session_complete,
+        "question_type": qtype,
     }

@@ -248,15 +248,21 @@ def enrich_question(stem: str, correct_answer: str, exam_slug: str, domain: str 
     return result
 
 
+def _get_exam_meta(exam_slug: str) -> dict:
+    """Return exam metadata dict; falls back gracefully for custom exams."""
+    return EXAM_METADATA.get(exam_slug, {"title": exam_slug, "code": "", "domains": []})
+
+
 def generate_question(exam_slug: str, domain: str) -> dict:
     """Synchronous call — returns parsed JSON dict with normalized options and option_explanations."""
-    meta = EXAM_METADATA[exam_slug]
-    domain_list = ", ".join(d["name"] for d in meta["domains"])
+    meta = _get_exam_meta(exam_slug)
+    domain_list = ", ".join(d["name"] for d in meta["domains"]) if meta["domains"] else domain
+    title_str = f"{meta['title']} ({meta['code']})" if meta.get("code") else meta["title"]
     prompt = (
-        f"You are an expert AWS certification exam question writer for {meta['title']} ({meta['code']}).\n"
+        f"You are an expert certification exam question writer for {title_str}.\n"
         f"Domains: {domain_list}\n"
-        f'Generate ONE MCQ for domain: "{domain}", difficulty: medium.\n'
-        "Scenario-based stem, 4 options A-D, one correct answer. "
+        f'Generate ONE single-answer MCQ for domain: "{domain}", difficulty: medium.\n'
+        "Scenario-based stem, 4 options A-D, exactly one correct answer. "
         "Also explain why each option is correct or incorrect in 1-2 sentences.\n"
         "Respond ONLY in valid JSON, no markdown, no explanation outside the JSON.\n"
         'Format: {"stem": "...", '
@@ -275,6 +281,88 @@ def generate_question(exam_slug: str, domain: str) -> dict:
     result["options"] = _normalize_options(result.get("options", []))
     if "option_explanations" not in result or not isinstance(result["option_explanations"], dict):
         result["option_explanations"] = {}
+    result["question_type"] = "single"
+    return result
+
+
+def generate_multi_question(exam_slug: str, domain: str) -> dict:
+    """Generate a multi-select question where 2 or 3 options are correct.
+
+    Returns same shape as generate_question but correct_answer is comma-separated
+    e.g. "A,C" or "A,B,D", and question_type="multi".
+    """
+    meta = _get_exam_meta(exam_slug)
+    domain_list = ", ".join(d["name"] for d in meta["domains"]) if meta["domains"] else domain
+    title_str = f"{meta['title']} ({meta['code']})" if meta.get("code") else meta["title"]
+    prompt = (
+        f"You are an expert certification exam question writer for {title_str}.\n"
+        f"Domains: {domain_list}\n"
+        f'Generate ONE multi-select question for domain: "{domain}", difficulty: medium.\n'
+        "IMPORTANT: The question must require the user to SELECT EITHER 2 OR 3 correct answers (you decide which). "
+        "The stem MUST include phrasing like '(Select TWO)' or '(Select THREE)' at the end.\n"
+        "Scenario-based stem, 4 options A-D. 2 or 3 options are correct, the rest are plausible distractors.\n"
+        "correct_answer must be a comma-separated string of the correct keys, e.g. 'A,C' or 'A,B,D'.\n"
+        "Also explain why each option is correct or incorrect in 1-2 sentences.\n"
+        "Respond ONLY in valid JSON, no markdown, no explanation outside the JSON.\n"
+        'Format: {"stem": "... (Select TWO)", '
+        '"options": [{"key": "A", "text": "..."}, {"key": "B", "text": "..."}, {"key": "C", "text": "..."}, {"key": "D", "text": "..."}], '
+        '"correct_answer": "A,C", '
+        '"explanation": "...", '
+        '"option_explanations": {"A": "Correct — because ...", "B": "Incorrect — because ...", "C": "Correct — because ...", "D": "Incorrect — because ..."}}'
+    )
+    provider = _provider()
+    if provider == "anthropic":
+        result = _anthropic_generate(prompt)
+    elif provider == "google":
+        result = _google_generate(prompt)
+    else:
+        result = _groq_generate(prompt)
+    result["options"] = _normalize_options(result.get("options", []))
+    if "option_explanations" not in result or not isinstance(result["option_explanations"], dict):
+        result["option_explanations"] = {}
+    result["question_type"] = "multi"
+    # Normalize correct_answer: sort and uppercase
+    ca = result.get("correct_answer", "")
+    parts = sorted(k.strip().upper() for k in ca.split(",") if k.strip())
+    result["correct_answer"] = ",".join(parts)
+    return result
+
+
+def generate_fill_question(exam_slug: str, domain: str) -> dict:
+    """Generate a fill-in-the-blank question with 4 options, one correct.
+
+    The stem contains exactly '[BLANK]'. correct_answer is a single key.
+    question_type="fill".
+    """
+    meta = _get_exam_meta(exam_slug)
+    domain_list = ", ".join(d["name"] for d in meta["domains"]) if meta["domains"] else domain
+    title_str = f"{meta['title']} ({meta['code']})" if meta.get("code") else meta["title"]
+    prompt = (
+        f"You are an expert certification exam question writer for {title_str}.\n"
+        f"Domains: {domain_list}\n"
+        f'Generate ONE fill-in-the-blank question for domain: "{domain}", difficulty: medium.\n'
+        "The stem must be a sentence with exactly one '[BLANK]' placeholder where the correct answer fits. "
+        "Example: 'AWS [BLANK] is used to manage encryption keys for data at rest and in transit.'\n"
+        "Provide 4 options A-D. Exactly ONE option correctly fills the blank. The other 3 are plausible but wrong.\n"
+        "Also explain why each option is correct or incorrect in 1-2 sentences.\n"
+        "Respond ONLY in valid JSON, no markdown, no explanation outside the JSON.\n"
+        'Format: {"stem": "AWS [BLANK] is used to ...", '
+        '"options": [{"key": "A", "text": "..."}, {"key": "B", "text": "..."}, {"key": "C", "text": "..."}, {"key": "D", "text": "..."}], '
+        '"correct_answer": "B", '
+        '"explanation": "...", '
+        '"option_explanations": {"A": "Incorrect — because ...", "B": "Correct — because ...", "C": "Incorrect — because ...", "D": "Incorrect — because ..."}}'
+    )
+    provider = _provider()
+    if provider == "anthropic":
+        result = _anthropic_generate(prompt)
+    elif provider == "google":
+        result = _google_generate(prompt)
+    else:
+        result = _groq_generate(prompt)
+    result["options"] = _normalize_options(result.get("options", []))
+    if "option_explanations" not in result or not isinstance(result["option_explanations"], dict):
+        result["option_explanations"] = {}
+    result["question_type"] = "fill"
     return result
 
 
