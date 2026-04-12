@@ -161,3 +161,8 @@ class CreateCourseRequest(BaseModel):
 class ExtendTrialRequest(BaseModel):
     days: int = Field(..., ge=1, le=90)
     exam_slug: str = ""  # required only when no trial exists yet for the user
+
+
+class GrantAccessRequest(BaseModel):
+    exam_slug: str = Field(..., min_length=1)
+    days: int = Field(default=365, ge=1, le=3650)  # default 1 year

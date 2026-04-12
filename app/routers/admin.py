@@ -9,7 +9,7 @@ from fastapi.responses import Response, StreamingResponse
 from app.middleware.auth import get_current_user
 from app.middleware.session import validate_session
 from app.services.database import fetchone, fetchall, execute
-from app.schemas.models import CouponResponse, CreateCouponRequest, CreateCourseRequest, ExtendTrialRequest
+from app.schemas.models import CouponResponse, CreateCouponRequest, CreateCourseRequest, ExtendTrialRequest, GrantAccessRequest
 from app.services.ai import EXAM_METADATA, enrich_question
 from app.services.platform_settings import get_all_settings, set_setting
 
@@ -101,6 +101,30 @@ async def extend_trial(
             (str(uuid.uuid4()), user_id, body.exam_slug, new_expires),
         )
         execute("UPDATE users SET trial_used = TRUE WHERE id = %s", (user_id,))
+    return {"ok": True, "new_expires_at": new_expires.isoformat()}
+
+
+# ── Grant complimentary access ────────────────────────────────────────────────
+
+@router.post("/users/{user_id}/grant-access")
+async def grant_access(
+    user_id: str,
+    body: GrantAccessRequest,
+    admin_id: str = Depends(require_admin),
+):
+    """Grant a user paid access to an exam without payment."""
+    # Expire any existing active/trial subscription for this exam first
+    execute(
+        "UPDATE user_subscriptions SET status = 'expired' "
+        "WHERE user_id = %s AND exam_slug = %s AND status IN ('active', 'trial')",
+        (user_id, body.exam_slug),
+    )
+    new_expires = datetime.now(timezone.utc) + timedelta(days=body.days)
+    execute(
+        "INSERT INTO user_subscriptions (id, user_id, exam_slug, status, expires_at) "
+        "VALUES (%s, %s, %s, 'active', %s)",
+        (str(uuid.uuid4()), user_id, body.exam_slug, new_expires),
+    )
     return {"ok": True, "new_expires_at": new_expires.isoformat()}
 
 
