@@ -394,3 +394,62 @@ def _groq_generate(prompt: str) -> dict:
         max_tokens=1536,
     )
     return _parse_json(resp.choices[0].message.content or "")
+
+
+# ── Raw text generation (classifier / short completions) ─────────────────────
+
+def _raw_generate(prompt: str) -> str:
+    """Single-turn non-streaming text completion. Returns raw response string."""
+    provider = _provider()
+    if provider == "anthropic":
+        client = _get_anthropic_client()
+        import anthropic as _anthropic
+        msg = _anthropic.Anthropic(api_key=settings.anthropic_api_key).messages.create(
+            model=_model(),
+            max_tokens=10,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    elif provider == "google":
+        import google.generativeai as genai
+        genai.configure(api_key=settings.google_api_key)
+        model = genai.GenerativeModel(_model())
+        return model.generate_content(prompt).text.strip()
+    else:  # groq
+        from groq import Groq
+        client = Groq(api_key=settings.groq_api_key)
+        resp = client.chat.completions.create(
+            model=_model(),
+            max_tokens=10,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+
+def classify_on_topic(
+    exam_title: str,
+    exam_code: str,
+    domain_list: str,
+    last_assistant_msg: str,
+    user_msg: str,
+) -> bool:
+    """
+    Returns True if the user message is on-topic for this exam or is a
+    conversational follow-up to the last assistant message.
+    Returns False only if clearly about a different certification/topic.
+    Fails open (returns True) on any error so users are never blocked.
+    """
+    context = f'Prior assistant context: "{last_assistant_msg[:200]}"\n' if last_assistant_msg else ""
+    prompt = (
+        f'Relevance classifier. User is studying "{exam_title}" ({exam_code}). '
+        f"Domains: {domain_list}.\n"
+        f"{context}"
+        "Is the user message on-topic for this exam OR a conversational follow-up "
+        "to the context above? Reply YES or NO only.\n"
+        f'User: "{user_msg}"'
+    )
+    try:
+        answer = _raw_generate(prompt).upper()
+        return answer.startswith("Y")
+    except Exception:
+        return True  # fail open — never block user on classifier error
