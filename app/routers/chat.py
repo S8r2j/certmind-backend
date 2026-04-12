@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from datetime import datetime, timezone
 from app.middleware.auth import get_current_user
 from app.middleware.session import validate_session
-from app.services.database import fetchone, execute
+from app.services.database import fetchone, fetchall, execute
 from app.services.ai import stream_chat, EXAM_METADATA
 from app.services.sanitize import sanitize_input
 from app.schemas.models import ChatRequest
@@ -14,6 +14,58 @@ from app.core.config import settings
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 MAX_TOKENS_PER_DAY = 50000
+
+
+def _build_progress_context(progress: dict | None, recent_attempts: list | None) -> str:
+    """Build a rich progress snapshot string to inject into the system prompt."""
+    if not progress or not progress.get("total_answered"):
+        return ""  # no practice data yet
+
+    total = progress["total_answered"]
+    correct = progress["total_correct"]
+    accuracy = round(100 * correct / total) if total else 0
+    streak = progress.get("streak_days", 0)
+    scores = progress.get("domain_scores") or {}
+
+    def _tag(pct: int) -> str:
+        if pct >= 70: return "Strong"
+        if pct >= 55: return "Improving"
+        if pct >= 40: return "Needs Work"
+        return "Weakest"
+
+    lines = [
+        "\n\n## Student Progress Snapshot",
+        f"- Questions answered: {total}  |  Overall accuracy: {accuracy}%"
+        f"  |  Streak: {streak} day{'s' if streak != 1 else ''}",
+        "",
+        "### Domain Breakdown (weakest → strongest)",
+    ]
+
+    sorted_domains = sorted(
+        scores.items(),
+        key=lambda x: x[1]["correct"] / x[1]["total"] if x[1]["total"] > 0 else 0,
+    )
+    for domain, ds in sorted_domains:
+        pct = round(100 * ds["correct"] / ds["total"]) if ds["total"] > 0 else 0
+        lines.append(f"- {domain}: {pct}% ({ds['correct']}/{ds['total']}) — {_tag(pct)}")
+
+    if recent_attempts:
+        lines.append("\n### Recent Question Performance (last 10, most recent first)")
+        for a in (recent_attempts or []):
+            result = "✓ Correct" if a["is_correct"] else "✗ Incorrect"
+            stem_preview = a["stem"][:100] + ("…" if len(a["stem"]) > 100 else "")
+            lines.append(f"- {result} [{a['domain']}] {stem_preview}")
+
+    focus = [d for d, ds in sorted_domains
+             if ds["total"] > 0 and (ds["correct"] / ds["total"]) < 0.70]
+    if focus:
+        lines.append(f"\nKey focus areas: {', '.join(focus[:3])}")
+
+    lines.append(
+        "\nUse this data to give targeted, personalized advice. "
+        "When the student asks what to study or where they struggle, reference these specifics by name."
+    )
+    return "\n".join(lines)
 
 
 def _check_token_budget(user_id: str, subscription_id: str) -> None:
@@ -109,8 +161,8 @@ async def chat_message(
     meta = EXAM_METADATA.get(body.exam_slug, {})
     exam_title = meta.get("title", body.exam_slug)
 
-    # Fetch subscription and progress in parallel (independent of each other)
-    sub, progress = await asyncio.gather(
+    # Fetch subscription, full progress, and recent attempts in parallel
+    sub, progress, recent_attempts = await asyncio.gather(
         asyncio.to_thread(
             fetchone,
             "SELECT id, expires_at FROM user_subscriptions "
@@ -119,7 +171,17 @@ async def chat_message(
         ),
         asyncio.to_thread(
             fetchone,
-            "SELECT domain_scores FROM user_progress WHERE user_id = %s AND exam_slug = %s",
+            "SELECT domain_scores, total_answered, total_correct, streak_days "
+            "FROM user_progress WHERE user_id = %s AND exam_slug = %s",
+            (user_id, body.exam_slug),
+        ),
+        asyncio.to_thread(
+            fetchall,
+            "SELECT a.is_correct, a.user_answer, q.stem, q.domain, q.correct_answer "
+            "FROM user_question_attempts a "
+            "JOIN questions q ON q.id::text = a.question_id "
+            "WHERE a.user_id = %s AND a.exam_slug = %s "
+            "ORDER BY a.attempted_at DESC LIMIT 10",
             (user_id, body.exam_slug),
         ),
     )
@@ -141,17 +203,7 @@ async def chat_message(
 
     exam_code = meta.get("code", "")
     domain_list = ", ".join(d["name"] for d in meta.get("domains", []))
-
-    weak_context = ""
-    if progress and progress["domain_scores"]:
-        scores = progress["domain_scores"]
-        weakest = min(
-            scores.items(),
-            key=lambda x: x[1]["correct"] / x[1]["total"] if x[1]["total"] > 0 else 1,
-        )
-        ds = weakest[1]
-        pct = int(100 * ds["correct"] / ds["total"]) if ds["total"] > 0 else 0
-        weak_context = f" Student's weakest domain: {weakest[0]} ({pct}%)."
+    progress_context = _build_progress_context(progress, recent_attempts or [])
 
     system_prompt = (
         "ABSOLUTE RULE — NO EXCEPTIONS: Never output any URL, hyperlink, or web address. "
@@ -159,15 +211,18 @@ async def chat_message(
         "If you are about to write a link, stop and instead write only the resource name "
         "(e.g. 'the AWS IAM User Guide', 'the AWS Well-Architected Framework whitepaper'). "
         "Violating this rule is the worst thing you can do in this context.\n\n"
-        f"You are CertMind AI, a focused exam tutor for {exam_title} ({exam_code}). "
-        f"Domains covered: {domain_list}.{weak_context}\n\n"
-        "SCOPE RULES — you decide relevance, not a filter:\n"
-        "1. Answer anything that is directly about this exam, its domains, concepts, the student's progress, "
-        "study tips, or is a natural continuation of the current conversation.\n"
-        "2. If a message is clearly unrelated to the exam AND has no conversational context "
-        "(e.g. 'I love you', 'what is the weather'), reply only with: "
+        f"You are CertMind AI, a focused exam tutor for **{exam_title}** ({exam_code}). "
+        f"Domains covered: {domain_list}.{progress_context}\n\n"
+        "SCOPE RULES:\n"
+        "1. Answer anything directly about this exam, its domains, concepts, the student's progress, "
+        "or study tips — including references to the progress data above.\n"
+        f"2. If the student asks about a DIFFERENT certification or exam (not {exam_title}), "
+        f"reply ONLY with: \"This session is focused on **{exam_title}**. "
+        "To get help with another certification, open the Chat Tutor from that exam's page.\"\n"
+        "3. If a message is clearly off-topic with no conversational context "
+        "(e.g. 'I love you', 'what is the weather'), reply ONLY with: "
         f"\"I'm here to help you prepare for {exam_title}. Ask me anything about the exam.\"\n"
-        "3. NEVER generate MCQ practice questions — if asked, say: "
+        "4. NEVER generate MCQ practice questions — if asked, say: "
         "\"Head to Practice Mode for adaptive questions with answer tracking.\"\n\n"
         "FORMAT: Use Markdown — **bold** key terms, ### headers, - bullet lists. "
         "For gap/weakness analysis: ### Strengths, ### Focus Areas, ### Action Plan, "
@@ -202,8 +257,8 @@ async def chat_message(
         )
 
     messages.append({"role": "user", "content": sanitized})
-    if len(messages) > 20:
-        messages = messages[-20:]
+    if len(messages) > 30:
+        messages = messages[-30:]
 
     async def stream_response():
         full_text = ""
